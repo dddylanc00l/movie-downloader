@@ -1,0 +1,9 @@
+C:\Users\dylan\AppData\Local\Python\bin\python.exe movie.py "url"
+
+
+
+C:\Users\dylan\AppData\Local\Python\bin\python.exe -m yt_dlp -v ^
+  --referer "https://vidcore.io/" ^
+  "URL"
+
+https://moon.peakstorm.top/vd/ZXlpZTFVOWVyNkcybDc4aU5VWGlrZzpZYXZNNG13T1oycWk0R2FlaS1pakhBQkptUjRudUdxWVlqRVQtYndXYXZR/master.m3u8
