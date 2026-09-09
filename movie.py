@@ -9,12 +9,17 @@ import json
 from datetime import datetime
 from urllib.parse import quote
 import pickle
+import shutil
 
 # Your Python path
 PYTHON_PATH = r"C:\Users\dylan\AppData\Local\Python\bin\python.exe"
 
 # Progress file
 PROGRESS_FILE = "download_progress.pkl"
+MOVIES_FOLDER = "movies"
+
+# Create movies folder if it doesn't exist
+os.makedirs(MOVIES_FOLDER, exist_ok=True)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -36,17 +41,18 @@ class DownloadProgress:
         self.failed_episodes = []
         self.season_episode_counts = {}
         self.start_time = None
+        self.download_folder = MOVIES_FOLDER
     
     def save(self):
         try:
-            with open(PROGRESS_FILE, 'wb') as f:
+            with open(os.path.join(self.download_folder, PROGRESS_FILE), 'wb') as f:
                 pickle.dump(self, f)
         except:
             pass
     
     def load(self):
         try:
-            with open(PROGRESS_FILE, 'rb') as f:
+            with open(os.path.join(MOVIES_FOLDER, PROGRESS_FILE), 'rb') as f:
                 return pickle.load(f)
         except:
             return None
@@ -56,196 +62,151 @@ class DownloadProgress:
             return 0
         return (self.downloaded_episodes / self.total_episodes) * 100
 
-def search_imdb(query):
-    """Search IMDb using the API"""
-    print(f"\n🔍 Searching IMDb for: {query}")
-    
-    try:
-        first_char = query[0].lower()
-        url = f"https://v2.sg.media-imdb.com/suggestion/{first_char}/{query}.json"
-        
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get('d', [])
-            
-            if results:
-                filtered_results = []
-                for result in results:
-                    imdb_id = result.get('id', '')
-                    if imdb_id.startswith('tt'):
-                        filtered_results.append(result)
-                
-                if filtered_results:
-                    print(f"✅ Found {len(filtered_results)} results:")
-                    for i, result in enumerate(filtered_results[:5], 1):
-                        imdb_id = result.get('id', '')
-                        title = result.get('l', '')
-                        year = result.get('y', '')
-                        is_series = result.get('q', '') == 'TV series' or result.get('q', '') == 'TVSeries'
-                        type_display = 'TV Series' if is_series else 'Movie'
-                        print(f"   {i}. {imdb_id} - {title} ({year}) [{type_display}]")
-                    
-                    if len(filtered_results) == 1:
-                        return filtered_results[0]
-                    else:
-                        choice = input(f"\nSelect number (1-{min(5, len(filtered_results))}): ").strip()
-                        try:
-                            idx = int(choice) - 1
-                            if 0 <= idx < len(filtered_results):
-                                return filtered_results[idx]
-                        except:
-                            pass
-                        return filtered_results[0]
-    except Exception as e:
-        print(f"   ⚠️ Search failed: {e}")
-    
-    return None
+# ============ IMDb SCRAPER FUNCTIONS ============
 
-def get_series_info(imdb_id):
+def classify(q_value: str) -> str:
     """
-    Get accurate season and episode info from IMDb.
-    Uses multiple methods to ensure accuracy.
+    Turn IMDb's free-text 'q' field into a clean category.
+    Handles 'TV series', 'TV mini-series', 'TV special', 'TV movie',
+    'Podcast series', missing/empty values, and case differences.
     """
-    try:
-        url = f"https://www.imdb.com/title/{imdb_id}/"
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        
-        if response.status_code != 200:
-            return {}, 0
-        
-        text = response.text
-        
-        # ---- METHOD 1: JSON-LD Structured Data ----
-        seasons_info = {}
-        json_ld_matches = re.findall(r'<script type="application/ld\+json">(.*?)</script>', text, re.DOTALL)
-        
-        for json_ld in json_ld_matches:
-            try:
-                data = json.loads(json_ld)
-                if isinstance(data, dict):
-                    # Check if it's a TV series
-                    if data.get('@type') == 'TVSeries':
-                        # Get number of seasons
-                        if 'numberOfSeasons' in data:
-                            total_seasons = int(data['numberOfSeasons'])
-                            
-                            # Try to get episode counts per season from containsSeason
-                            if 'containsSeason' in data:
-                                for season_data in data['containsSeason']:
-                                    if isinstance(season_data, dict):
-                                        season_num = int(season_data.get('seasonNumber', 0))
-                                        episode_count = int(season_data.get('numberOfEpisodes', 0))
-                                        if season_num > 0 and episode_count > 0:
-                                            seasons_info[season_num] = episode_count
-                            
-                            # If we got seasons from containsSeason, return it
-                            if seasons_info:
-                                print(f"✅ Found {len(seasons_info)} seasons from JSON-LD")
-                                for season, count in seasons_info.items():
-                                    print(f"   Season {season}: {count} episodes")
-                                return seasons_info, len(seasons_info)
-            except:
-                pass
-        
-        # ---- METHOD 2: Parse the episode page ----
-        # If JSON-LD didn't work, we need to check each season individually
-        print("🔍 Scraping episode pages to find seasons...")
-        
-        # First, try to find how many seasons there are
-        season_matches = re.findall(r'data-season-number="(\d+)"', text)
-        if not season_matches:
-            season_matches = re.findall(r'Season\s+(\d+)', text)
-        if not season_matches:
-            season_matches = re.findall(r'"season":"(\d+)"', text)
-        
-        if season_matches:
-            season_numbers = sorted(set([int(s) for s in season_matches]))
-            total_seasons = len(season_numbers)
-            print(f"📊 Found {total_seasons} season(s)")
-            
-            # For each season, get the episode count
-            for season_num in season_numbers:
-                episode_count = get_episode_count_from_page(imdb_id, season_num)
-                if episode_count > 0:
-                    seasons_info[season_num] = episode_count
-                    print(f"   Season {season_num}: {episode_count} episodes")
-                else:
-                    # If we can't get the count, prompt the user
-                    episode_count = input(f"How many episodes in season {season_num}? (default: 10): ").strip()
-                    try:
-                        episodes = int(episode_count) if episode_count else 10
-                        seasons_info[season_num] = episodes
-                    except:
-                        seasons_info[season_num] = 10
-            
-            return seasons_info, len(seasons_info)
-        
-        # ---- METHOD 3: Fallback - prompt user ----
-        print("⚠️ Could not automatically detect seasons and episodes")
-        seasons_info = {}
-        
-        while True:
-            season_num = input("\nEnter season number (or 'done' to finish): ").strip()
-            if season_num.lower() == 'done':
-                break
-            try:
-                season = int(season_num)
-                episode_count = input(f"Enter number of episodes for season {season}: ").strip()
-                try:
-                    episodes = int(episode_count) if episode_count else 10
-                    seasons_info[season] = episodes
-                except:
-                    seasons_info[season] = 10
-            except:
-                print("❌ Invalid input")
-        
-        return seasons_info, len(seasons_info)
-        
-    except Exception as e:
-        print(f"❌ Error getting series info: {e}")
-        return {}, 0
+    q = (q_value or "").strip().lower()
 
-def get_episode_count_from_page(imdb_id, season):
-    """Get episode count for a specific season from the episode page"""
+    if "series" in q:
+        return "series"
+    if q in ("tv movie", "movie", "video", "short"):
+        return "movie"
+    if "tv" in q:
+        # e.g. "tv special" — treat as a one-off, not a season-based series
+        return "movie"
+    return "unknown"
+
+def search_imdb(query: str, limit: int = 5):
+    """Search IMDb's suggestion API and return a list of candidate results."""
+    if not query:
+        return []
+
+    first_char = query[0].lower() if query[0].isalnum() else "a"
+    url = f"https://v2.sg.media-imdb.com/suggestion/{first_char}/{query}.json"
+
     try:
-        url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season}"
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        
-        if response.status_code != 200:
-            return 0
-        
-        text = response.text
-        
-        # Method 1: Count episode containers
-        episode_count = len(re.findall(r'episode-container', text))
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        print(f"⚠️ Search failed: {e}")
+        return []
+
+    results = [r for r in data.get('d', []) if r.get('id', '').startswith('tt')]
+    return results[:limit]
+
+def get_series_info(imdb_id: str) -> dict:
+    """
+    Return {season_number: episode_count} for a series by scraping the
+    public IMDb episodes page. Returns {} if it can't be determined
+    automatically (caller should fall back to manual entry).
+    """
+    seasons_info = {}
+
+    try:
+        url = f"https://www.imdb.com/title/{imdb_id}/episodes"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        text = resp.text
+    except requests.RequestException as e:
+        print(f"❌ Could not access episode page: {e}")
+        return {}
+
+    season_numbers = []
+    season_options = re.findall(r'<option[^>]*value="(\d+)"[^>]*>', text)
+    if season_options:
+        season_numbers = sorted({int(s) for s in season_options if s.isdigit()})
+
+    if not season_numbers:
+        season_attrs = re.findall(r'data-season-number="(\d+)"', text)
+        if season_attrs:
+            season_numbers = sorted({int(s) for s in season_attrs})
+
+    if not season_numbers:
+        season_text = re.findall(r'Season\s+(\d+)', text)
+        if season_text:
+            season_numbers = sorted({int(s) for s in season_text})
+
+    for season_num in season_numbers:
+        episode_count = 0
+        season_url = f"https://www.imdb.com/title/{imdb_id}/episodes?season={season_num}"
+        try:
+            season_resp = requests.get(season_url, headers=HEADERS, timeout=15)
+            season_resp.raise_for_status()
+            season_text = season_resp.text
+        except requests.RequestException:
+            continue
+
+        episode_containers = re.findall(r'episode-container', season_text)
+        if episode_containers:
+            episode_count = len(episode_containers)
+        else:
+            episode_links = re.findall(
+                rf'/title/tt\d+/episodes\?season={season_num}&episode=(\d+)', season_text
+            )
+            if episode_links:
+                episode_count = len(set(episode_links))
+            else:
+                episode_items = re.findall(r'itemprop="episode"', season_text)
+                if episode_items:
+                    episode_count = len(episode_items)
+
         if episode_count > 0:
-            return episode_count
-        
-        # Method 2: Count episode links
-        episode_links = re.findall(r'/title/tt\d+/episodes\?season=' + str(season) + r'&episode=\d+', text)
-        if episode_links:
-            return len(set(episode_links))
-        
-        # Method 3: Look for "episode" in JSON-LD
-        json_ld_matches = re.findall(r'<script type="application/ld\+json">(.*?)</script>', text, re.DOTALL)
-        for json_ld in json_ld_matches:
-            try:
-                data = json.loads(json_ld)
-                if isinstance(data, dict):
-                    if data.get('@type') == 'TVEpisode':
-                        return 1
-                    if 'numberOfEpisodes' in data:
-                        return int(data['numberOfEpisodes'])
-            except:
-                pass
-        
-        return 0
-        
-    except Exception as e:
-        print(f"⚠️ Could not get episode count for season {season}: {e}")
-        return 0
+            seasons_info[season_num] = episode_count
+
+    return seasons_info
+
+def lookup_imdb(query: str):
+    """Search for a title, classify it, and return metadata."""
+    results = search_imdb(query)
+    if not results:
+        print(f"❌ No results found for '{query}'")
+        return None
+
+    if len(results) > 1:
+        print(f"\n✅ Found {len(results)} results for '{query}':")
+        for i, r in enumerate(results, 1):
+            category = classify(r.get('q', ''))
+            print(f"   {i}. {r.get('id')} — {r.get('l')} ({r.get('y', '?')}) [{category}]")
+        choice = input(f"\nSelect number (1-{len(results)}), or Enter for first: ").strip()
+        try:
+            idx = int(choice) - 1 if choice else 0
+        except ValueError:
+            idx = 0
+        result = results[idx] if 0 <= idx < len(results) else results[0]
+    else:
+        result = results[0]
+
+    imdb_id = result.get('id', '')
+    title = result.get('l', imdb_id)
+    year = result.get('y', '?')
+    category = classify(result.get('q', ''))
+
+    print(f"\n✅ {title} ({year}) — {imdb_id} — classified as: {category}")
+
+    info = {"imdb_id": imdb_id, "title": title, "year": year, "type": category}
+
+    if category == "series":
+        print("\n📺 Fetching season/episode info...")
+        seasons_info = get_series_info(imdb_id)
+        if seasons_info:
+            total_eps = sum(seasons_info.values())
+            print(f"📺 {len(seasons_info)} season(s), {total_eps} total episodes:")
+            for s, c in sorted(seasons_info.items()):
+                print(f"   Season {s}: {c} episodes")
+            info["seasons"] = seasons_info
+        else:
+            print("⚠️ Could not auto-detect season/episode counts.")
+            info["seasons"] = {}
+
+    return info
+
+# ============ DOWNLOAD FUNCTIONS ============
 
 def construct_vidcore_url(imdb_id, is_series=False, season=1, episode=1):
     """Construct the VidCore URL using IMDb ID directly"""
@@ -273,8 +234,8 @@ def wait_for_internet(max_wait=300):
         print(f"   Waiting... {waited}s / {max_wait}s", end="\r")
     return False
 
-def open_vidcore_and_download(url, title=None, episode_info=None, progress=None, retry_count=0):
-    """Open VidCore and download the video with yt-dlp progress"""
+def open_vidcore_and_download(url, title=None, episode_info=None, progress=None, retry_count=0, is_movie=False):
+    """Open VidCore and download the video with quality selection"""
     
     max_retries = 3
     
@@ -283,6 +244,8 @@ def open_vidcore_and_download(url, title=None, episode_info=None, progress=None,
     
     if episode_info:
         print(f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}")
+    elif is_movie:
+        print(f"🎬 MOVIE: {title}")
     
     if not check_internet():
         if not wait_for_internet():
@@ -335,53 +298,133 @@ def open_vidcore_and_download(url, title=None, episode_info=None, progress=None,
         if retry_count < max_retries:
             print(f"\n🔄 Retry {retry_count + 1}/{max_retries}")
             time.sleep(3)
-            return open_vidcore_and_download(url, title, episode_info, progress, retry_count + 1)
+            return open_vidcore_and_download(url, title, episode_info, progress, retry_count + 1, is_movie)
+        
+        # If this was a movie URL that failed, try series URL as fallback
+        if is_movie and 'movie' in url:
+            print("\n🔄 Movie URL failed. Trying series URL format as fallback...")
+            imdb_id = url.split('/movie/')[-1]
+            series_url = f"https://vidcore.io/tv/{imdb_id}/1/1"
+            print(f"   Trying: {series_url}")
+            return open_vidcore_and_download(series_url, title, {'season': 1, 'episode': 1}, progress, 0, False)
+        
         return False
     
-    # Save and download with yt-dlp showing progress
+    # ---- QUALITY SELECTION ----
+    print("\n" + "="*70)
+    print("📋 QUALITY OPTIONS:")
+    print("   1. Best available (auto)")
+    print("   2. 4K (2160p) - if available")
+    print("   3. 1080p - Full HD")
+    print("   4. 720p - HD")
+    print("   5. 480p - Standard")
+    print("   6. Audio only")
+    print("="*70)
+    
+    quality_choice = input("\nSelect quality option (1-6): ").strip() or "1"
+    
+    # Map quality choice to yt-dlp format selector
+    quality_map = {
+        '1': 'bestvideo+bestaudio/best',
+        '2': 'bestvideo[height>=2160]+bestaudio/best',
+        '3': 'bestvideo[height>=1080]+bestaudio/best',
+        '4': 'bestvideo[height>=720]+bestaudio/best',
+        '5': 'bestvideo[height>=480]+bestaudio/best',
+        '6': 'bestaudio/best',
+    }
+    
+    # Additional quality options
+    print("\n📋 ADDITIONAL OPTIONS:")
+    print("   1. Download video only")
+    print("   2. Download audio only")
+    print("   3. Download both (default)")
+    
+    additional_choice = input("\nSelect option (1-3): ").strip() or "3"
+    
+    format_selector = quality_map.get(quality_choice, 'bestvideo+bestaudio/best')
+    
+    # Build yt-dlp command
+    yt_dlp_cmd = [
+        PYTHON_PATH,
+        "-m", "yt_dlp",
+        "--referer", "https://vidcore.io/",
+        m3u8_url,
+    ]
+    
+    # Add format selector
+    if additional_choice == '1':
+        yt_dlp_cmd.extend(["-f", format_selector.replace('+bestaudio', '')])
+    elif additional_choice == '2':
+        yt_dlp_cmd.extend(["-f", "bestaudio/best"])
+    else:
+        yt_dlp_cmd.extend(["-f", format_selector])
+    
+    # Add merge format for best compatibility
+    if additional_choice != '2':
+        yt_dlp_cmd.extend(["--merge-output-format", "mkv"])
+    
+    # Add subtitle options
+    subs = input("\nDownload subtitles? (y/n): ").strip().lower()
+    if subs == 'y':
+        yt_dlp_cmd.append("--write-subs")
+        yt_dlp_cmd.append("--sub-lang")
+        yt_dlp_cmd.append("en")
+    
+    # Save and download
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    download_folder = MOVIES_FOLDER
+    
     if title:
         safe_title = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
         if episode_info:
-            output_name = f"{safe_title}_S{episode_info['season']:02d}E{episode_info['episode']:02d}.%(ext)s"
+            quality_label = quality_choice
+            filename = f"{safe_title}_S{episode_info['season']:02d}E{episode_info['episode']:02d}_Q{quality_label}.%(ext)s"
         else:
-            output_name = f"{safe_title}_{timestamp}.%(ext)s"
+            quality_label = quality_choice
+            filename = f"{safe_title}_{timestamp}_Q{quality_label}.%(ext)s"
     else:
-        output_name = f"video_{timestamp}.%(ext)s"
+        filename = f"video_{timestamp}.%(ext)s"
     
-    print(f"\n📥 Downloading: {output_name}")
-    print("   yt-dlp will show progress below:")
+    output_path = os.path.join(download_folder, filename)
+    yt_dlp_cmd.extend(["-o", output_path])
+    
+    # Add progress options
+    yt_dlp_cmd.extend(["--progress", "--newline"])
+    
+    # Show what's being downloaded
+    print(f"\n📥 Downloading: {output_path}")
+    print(f"⚙️  Format: {format_selector}")
     print("-" * 50)
     
     try:
-        # Run yt-dlp with progress output
-        result = subprocess.run([
-            PYTHON_PATH,
-            "-m", "yt_dlp",
-            "--referer", "https://vidcore.io/",
-            m3u8_url,
-            "-o", output_name,
-            "--progress",
-            "--newline",
-            "--no-playlist"
-        ], capture_output=True, text=True)
+        process = subprocess.Popen(
+            yt_dlp_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
         
-        # yt-dlp outputs progress to stderr
-        if result.stderr:
-            print(result.stderr)
-        if result.stdout:
-            print(result.stdout)
+        while True:
+            output = process.stderr.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                if '[download]' in output or 'ETA' in output:
+                    print(f"   {output.strip()}")
+                else:
+                    print(f"   {output.strip()}")
         
-        if result.returncode == 0:
-            print(f"\n✅ Downloaded: {output_name}")
+        returncode = process.poll()
+        
+        if returncode == 0:
+            print(f"\n✅ Downloaded: {filename}")
             return True
         else:
             if retry_count < max_retries:
                 print(f"\n🔄 Retry {retry_count + 1}/{max_retries}")
-                if "Connection" in str(result.stderr) or "timeout" in str(result.stderr).lower():
-                    wait_for_internet()
                 time.sleep(3)
-                return open_vidcore_and_download(url, title, episode_info, progress, retry_count + 1)
+                return open_vidcore_and_download(url, title, episode_info, progress, retry_count + 1, is_movie)
             return False
             
     except Exception as e:
@@ -389,7 +432,7 @@ def open_vidcore_and_download(url, title=None, episode_info=None, progress=None,
         if retry_count < max_retries:
             print(f"\n🔄 Retry {retry_count + 1}/{max_retries}")
             time.sleep(3)
-            return open_vidcore_and_download(url, title, episode_info, progress, retry_count + 1)
+            return open_vidcore_and_download(url, title, episode_info, progress, retry_count + 1, is_movie)
         return False
 
 def download_series_auto(imdb_id, title, seasons_info):
@@ -419,80 +462,125 @@ def download_series_auto(imdb_id, title, seasons_info):
         progress.season_episode_counts = seasons_info
         progress.total_episodes = total_episodes
         progress.start_time = time.time()
+        progress.download_folder = MOVIES_FOLDER
         progress.save()
     
-    # Ask which seasons to download
-    if total_seasons > 1:
-        season_input = input(f"\nEnter seasons to download (e.g., 1,2,3 or 'all'): ").strip()
-        if season_input.lower() == 'all':
-            season_list = sorted(seasons_info.keys())
-        else:
-            try:
-                season_list = [int(s.strip()) for s in season_input.split(',')]
-            except:
-                print("⚠️ Invalid input, downloading all seasons")
-                season_list = sorted(seasons_info.keys())
-    else:
-        season_list = sorted(seasons_info.keys())
+    # Show download options
+    print(f"\n{'='*70}")
+    print("📋 DOWNLOAD OPTIONS:")
+    print("   1. Download a single episode")
+    print("   2. Download from Season X, Episode Y to Season Z, Episode W")
+    print("   3. Download entire series")
+    print(f"{'='*70}")
     
-    print(f"\n📊 Total episodes to download: {sum(seasons_info[s] for s in season_list)}")
-    print("🚀 Starting automatic download...")
+    choice = input("\nSelect option (1-3): ").strip()
     
-    # Download each episode
-    for season in season_list:
-        episode_count = seasons_info.get(season, 10)
+    if choice == '1':
+        season = int(input("Enter season number: ").strip() or "1")
+        episode = int(input("Enter episode number: ").strip() or "1")
         
-        print(f"\n{'='*70}")
-        print(f"📺 SEASON {season} ({episode_count} episodes)")
-        print(f"{'='*70}")
+        url = construct_vidcore_url(imdb_id, True, season, episode)
+        episode_info = {'season': season, 'episode': episode}
+        open_vidcore_and_download(url, title, episode_info, progress, 0, False)
         
-        # Ask which episodes to download in this season
-        episode_input = input(f"Enter episodes to download (e.g., 1,2,3 or 'all'): ").strip()
-        if episode_input.lower() == 'all':
-            episode_list = list(range(1, episode_count + 1))
-        else:
-            try:
-                episode_list = [int(e.strip()) for e in episode_input.split(',')]
-            except:
-                print("⚠️ Invalid input, downloading all episodes")
-                episode_list = list(range(1, episode_count + 1))
+    elif choice == '2':
+        start_season = int(input("Enter starting season: ").strip() or "1")
+        start_episode = int(input("Enter starting episode: ").strip() or "1")
+        end_season = int(input("Enter ending season: ").strip() or start_season)
+        end_episode = int(input("Enter ending episode: ").strip() or start_episode)
         
-        for episode in episode_list:
-            # Check if all episodes are done
+        if start_season > end_season or (start_season == end_season and start_episode > end_episode):
+            print("❌ Invalid range: start > end")
+            return
+        
+        episodes_to_download = []
+        for season in range(start_season, end_season + 1):
+            max_ep = seasons_info.get(season, 10)
+            if season == start_season and season == end_season:
+                ep_start = start_episode
+                ep_end = min(end_episode, max_ep)
+            elif season == start_season:
+                ep_start = start_episode
+                ep_end = max_ep
+            elif season == end_season:
+                ep_start = 1
+                ep_end = min(end_episode, max_ep)
+            else:
+                ep_start = 1
+                ep_end = max_ep
+            
+            for ep in range(ep_start, ep_end + 1):
+                episodes_to_download.append((season, ep))
+        
+        print(f"\n📊 Will download {len(episodes_to_download)} episodes")
+        confirm = input("Proceed? (y/n): ").strip().lower()
+        if confirm != 'y':
+            return
+        
+        for season, episode in episodes_to_download:
             if progress.downloaded_episodes >= progress.total_episodes:
                 print("\n✅ All episodes downloaded!")
                 progress.completed = True
                 progress.save()
                 return
             
-            # Check if this episode was already downloaded
             episode_key = {'season': season, 'episode': episode}
-            if episode_key in progress.failed_episodes:
-                print(f"\n🔄 Retrying S{season:02d}E{episode:02d}")
-            else:
-                print(f"\n📺 S{season:02d}E{episode:02d}")
-            
-            # Construct URL using IMDb ID directly
             url = construct_vidcore_url(imdb_id, True, season, episode)
             episode_info = {'season': season, 'episode': episode}
             
-            # Download
-            success = open_vidcore_and_download(url, title, episode_info, progress)
+            success = open_vidcore_and_download(url, title, episode_info, progress, 0, False)
             
             if success:
                 progress.downloaded_episodes += 1
                 progress.failed_episodes = [ep for ep in progress.failed_episodes 
                                           if not (ep['season'] == season and ep['episode'] == episode)]
                 progress.save()
-                print(f"✅ Downloaded S{season:02d}E{episode:02d}")
             else:
                 print(f"⚠️ Failed S{season:02d}E{episode:02d}")
                 if episode_key not in progress.failed_episodes:
                     progress.failed_episodes.append(episode_key)
                 progress.save()
             
-            # Small delay between episodes
             time.sleep(2)
+        
+    elif choice == '3':
+        print(f"\n📊 Will download {total_episodes} episodes")
+        confirm = input("Proceed? (y/n): ").strip().lower()
+        if confirm != 'y':
+            return
+        
+        for season in sorted(seasons_info.keys()):
+            episode_count = seasons_info[season]
+            
+            print(f"\n{'='*70}")
+            print(f"📺 SEASON {season} ({episode_count} episodes)")
+            print(f"{'='*70}")
+            
+            for episode in range(1, episode_count + 1):
+                if progress.downloaded_episodes >= progress.total_episodes:
+                    print("\n✅ All episodes downloaded!")
+                    progress.completed = True
+                    progress.save()
+                    return
+                
+                episode_key = {'season': season, 'episode': episode}
+                url = construct_vidcore_url(imdb_id, True, season, episode)
+                episode_info = {'season': season, 'episode': episode}
+                
+                success = open_vidcore_and_download(url, title, episode_info, progress, 0, False)
+                
+                if success:
+                    progress.downloaded_episodes += 1
+                    progress.failed_episodes = [ep for ep in progress.failed_episodes 
+                                              if not (ep['season'] == season and ep['episode'] == episode)]
+                    progress.save()
+                else:
+                    print(f"⚠️ Failed S{season:02d}E{episode:02d}")
+                    if episode_key not in progress.failed_episodes:
+                        progress.failed_episodes.append(episode_key)
+                    progress.save()
+                
+                time.sleep(2)
     
     # Final summary
     print(f"\n{'='*70}")
@@ -513,61 +601,71 @@ def download_series_auto(imdb_id, title, seasons_info):
     progress.save()
 
 def download_by_name(movie_name):
-    """Main function: search IMDb, get URL, download"""
+    """Main function: use IMDb scraper to get info, then download"""
     
     print("="*70)
-    print("🎬 VIDCORE AUTO-DOWNLOADER (IMDb Lookup)")
+    print("🎬 VIDCORE AUTO-DOWNLOADER")
     print("="*70)
     
-    # Search IMDb
-    result = search_imdb(movie_name)
-    if not result:
+    # Use the improved IMDb scraper
+    info = lookup_imdb(movie_name)
+    if not info:
         print("\n❌ Could not find movie/TV show")
         return
     
-    # Extract info from the API result
-    imdb_id = result.get('id', '')
-    title = result.get('l', imdb_id)
-    year = result.get('y', '')
+    imdb_id = info['imdb_id']
+    title = info['title']
+    category = info['type']
     
-    # Use the API's type detection
-    is_series = result.get('q', '') == 'TV series' or result.get('q', '') == 'TVSeries'
-    
-    print(f"\n✅ IMDb ID: {imdb_id}")
-    print(f"📽️ Title: {title} ({year})")
-    print(f"📺 Type: {'TV Series' if is_series else 'Movie'}")
-    
-    if is_series:
-        print("\n📺 Getting season and episode information from IMDb...")
-        seasons_info, total_seasons = get_series_info(imdb_id)
+    if category == "series":
+        seasons_info = info.get('seasons', {})
         
         if seasons_info:
-            print(f"\n✅ Found {total_seasons} season(s):")
-            for season, count in sorted(seasons_info.items()):
-                print(f"   Season {season}: {count} episodes")
+            download_series_auto(imdb_id, title, seasons_info)
+        else:
+            print("\n⚠️ No season information available.")
+            print("💡 Manual mode:")
             
-            download_all = input("\nDownload entire series? (y/n): ").lower() == 'y'
+            seasons_info = {}
+            while True:
+                season_num = input("\nEnter season number (or 'done' to finish): ").strip()
+                if season_num.lower() == 'done':
+                    break
+                try:
+                    season = int(season_num)
+                    episode_input = input(f"Enter number of episodes for season {season}: ").strip()
+                    try:
+                        episodes = int(episode_input) if episode_input else 10
+                        seasons_info[season] = episodes
+                        print(f"   Season {season}: {episodes} episodes")
+                    except:
+                        seasons_info[season] = 10
+                        print(f"   Season {season}: 10 episodes (default)")
+                except:
+                    print("❌ Invalid input")
             
-            if download_all:
+            if seasons_info:
                 download_series_auto(imdb_id, title, seasons_info)
             else:
-                # Manual selection
-                season = int(input("Enter season number: ") or "1")
-                episode = int(input("Enter episode number: ") or "1")
+                season = int(input("Enter season number (1): ") or "1")
+                episode = int(input("Enter episode number (1): ") or "1")
                 url = construct_vidcore_url(imdb_id, True, season, episode)
                 episode_info = {'season': season, 'episode': episode}
-                open_vidcore_and_download(url, title, episode_info)
-        else:
-            print("❌ Could not get season information")
-            # Fallback: let user manually enter
-            season = int(input("Enter season number (1): ") or "1")
-            episode = int(input("Enter episode number (1): ") or "1")
-            url = construct_vidcore_url(imdb_id, True, season, episode)
-            episode_info = {'season': season, 'episode': episode}
-            open_vidcore_and_download(url, title, episode_info)
+                open_vidcore_and_download(url, title, episode_info, None, 0, False)
     else:
+        # Movie
+        print(f"\n🎬 MOVIE: {title}")
         url = construct_vidcore_url(imdb_id, False)
-        open_vidcore_and_download(url, title)
+        success = open_vidcore_and_download(url, title, None, None, 0, True)
+        
+        if not success:
+            print("\n❌ Movie URL failed. Would you like to try the series format?")
+            if input("Try series format? (y/n): ").strip().lower() == 'y':
+                season = int(input("Enter season number (1): ") or "1")
+                episode = int(input("Enter episode number (1): ") or "1")
+                series_url = construct_vidcore_url(imdb_id, True, season, episode)
+                episode_info = {'season': season, 'episode': episode}
+                open_vidcore_and_download(series_url, title, episode_info, None, 0, False)
 
 def main():
     """Main entry point"""
@@ -578,32 +676,37 @@ def main():
             open_vidcore_and_download(arg)
             return
         elif arg.startswith('tt'):
+            # IMDb ID provided directly
+            imdb_id = arg
             result = search_imdb(arg)
             if result:
-                imdb_id = result.get('id', arg)
-                title = result.get('l', imdb_id)
-                is_series = result.get('q', '') == 'TV series' or result.get('q', '') == 'TVSeries'
+                title = result[0].get('l', imdb_id) if result else imdb_id
+                category = classify(result[0].get('q', '')) if result else "unknown"
                 
-                if is_series:
+                if category == "series":
                     print(f"\n📺 TV Series: {title}")
-                    seasons_info, total_seasons = get_series_info(imdb_id)
+                    seasons_info = get_series_info(imdb_id)
                     if seasons_info:
-                        download_all = input("\nDownload entire series? (y/n): ").lower() == 'y'
-                        if download_all:
-                            download_series_auto(imdb_id, title, seasons_info)
-                        else:
-                            season = int(input("Enter season number (1): ") or "1")
-                            episode = int(input("Enter episode number (1): ") or "1")
-                            url = construct_vidcore_url(imdb_id, True, season, episode)
-                            episode_info = {'season': season, 'episode': episode}
-                            open_vidcore_and_download(url, title, episode_info)
+                        download_series_auto(imdb_id, title, seasons_info)
                     else:
-                        url = construct_vidcore_url(imdb_id, False)
-                        open_vidcore_and_download(url, title)
+                        season = int(input("Enter season number (1): ") or "1")
+                        episode = int(input("Enter episode number (1): ") or "1")
+                        url = construct_vidcore_url(imdb_id, True, season, episode)
+                        episode_info = {'season': season, 'episode': episode}
+                        open_vidcore_and_download(url, title, episode_info)
                 else:
                     print(f"\n🎬 Movie: {title}")
                     url = construct_vidcore_url(imdb_id, False)
-                    open_vidcore_and_download(url, title)
+                    success = open_vidcore_and_download(url, title, None, None, 0, True)
+                    
+                    if not success:
+                        print("\n❌ Movie URL failed. Would you like to try the series format?")
+                        if input("Try series format? (y/n): ").strip().lower() == 'y':
+                            season = int(input("Enter season number (1): ") or "1")
+                            episode = int(input("Enter episode number (1): ") or "1")
+                            series_url = construct_vidcore_url(imdb_id, True, season, episode)
+                            episode_info = {'season': season, 'episode': episode}
+                            open_vidcore_and_download(series_url, title, episode_info)
             return
         else:
             movie_name = ' '.join(sys.argv[1:])
@@ -614,7 +717,7 @@ def main():
         print("🎬 VIDCORE AUTO-DOWNLOADER")
         print("="*70)
         
-        # Check for saved progress
+        # Check for saved progress in movies folder
         progress = DownloadProgress().load()
         if progress and not progress.completed:
             print(f"\n📊 Found saved progress!")
@@ -641,29 +744,33 @@ def main():
             if imdb_id.startswith('tt'):
                 result = search_imdb(imdb_id)
                 if result:
-                    title = result.get('l', imdb_id)
-                    is_series = result.get('q', '') == 'TV series' or result.get('q', '') == 'TVSeries'
+                    title = result[0].get('l', imdb_id) if result else imdb_id
+                    category = classify(result[0].get('q', '')) if result else "unknown"
                     
-                    if is_series:
+                    if category == "series":
                         print(f"\n📺 This is a TV Series: {title}")
-                        seasons_info, total_seasons = get_series_info(imdb_id)
+                        seasons_info = get_series_info(imdb_id)
                         if seasons_info:
-                            download_all = input("\nDownload entire series? (y/n): ").lower() == 'y'
-                            if download_all:
-                                download_series_auto(imdb_id, title, seasons_info)
-                            else:
-                                season = int(input("Enter season number (1): ") or "1")
-                                episode = int(input("Enter episode number (1): ") or "1")
-                                url = construct_vidcore_url(imdb_id, True, season, episode)
-                                episode_info = {'season': season, 'episode': episode}
-                                open_vidcore_and_download(url, title, episode_info)
+                            download_series_auto(imdb_id, title, seasons_info)
                         else:
-                            url = construct_vidcore_url(imdb_id, False)
-                            open_vidcore_and_download(url, title)
+                            season = int(input("Enter season number (1): ") or "1")
+                            episode = int(input("Enter episode number (1): ") or "1")
+                            url = construct_vidcore_url(imdb_id, True, season, episode)
+                            episode_info = {'season': season, 'episode': episode}
+                            open_vidcore_and_download(url, title, episode_info)
                     else:
                         print(f"\n🎬 Movie: {title}")
                         url = construct_vidcore_url(imdb_id, False)
-                        open_vidcore_and_download(url, title)
+                        success = open_vidcore_and_download(url, title, None, None, 0, True)
+                        
+                        if not success:
+                            print("\n❌ Movie URL failed. Would you like to try the series format?")
+                            if input("Try series format? (y/n): ").strip().lower() == 'y':
+                                season = int(input("Enter season number (1): ") or "1")
+                                episode = int(input("Enter episode number (1): ") or "1")
+                                series_url = construct_vidcore_url(imdb_id, True, season, episode)
+                                episode_info = {'season': season, 'episode': episode}
+                                open_vidcore_and_download(series_url, title, episode_info)
             else:
                 print("❌ Invalid IMDb ID")
         elif choice == '3':
