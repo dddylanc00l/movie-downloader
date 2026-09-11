@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""
+VidCore Discord Downloader — Raspberry Pi edition
+- Discord UI with dropdowns + buttons (in-channel)
+- Only the requester can answer the prompts
+- Auto-upscale to 4K; deletes the non-4K original afterwards
+- DMs the user ONLY when the job finishes
+- Auto-resumes unfinished series after reboot
+- Uses Tampermonkey / Stream Detector via the X11 clipboard
+"""
+
+import subprocess
+import time
+import os
+import sys
+import re
+import json
+import pickle
+import asyncio
+import requests
+import threading
+import queue
+from datetime import datetime
+
+import discord
+from discord.ext import commands
+
+# =============================================================
+# CONFIG
+# =============================================================
+DISCORD_TOKEN   = "PASTE_YOUR_BOT_TOKEN_HERE"
+ALLOWED_USER_ID = 0                 # 0 = anyone; or your numeric Discord ID
+
+MOVIES_FOLDER   = "/mnt/minecraft-backups/videos"
+PROGRESS_FILE   = "download_progress.pkl"
+STATE_FILE      = "bot_state.json"
+
+PYTHON_PATH     = sys.executable
+YTDLP_MODULE    = "yt_dlp"
+
+CHROME_PATH      = "/usr/bin/chromium"
+CHROME_USER_DATA = "/home/grap/.config/chromium"
+
+# =============================================================
+# Setup
+# =============================================================
+os.makedirs(MOVIES_FOLDER, exist_ok=True)
+
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+    'Accept-Language': 'en-US,en;q=0.9',
+}
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+active_jobs = {}   # user_id -> asyncio.Task
+
+
+# =============================================================
+# Progress
+# =============================================================
+class DownloadProgress:
+    def __init__(self):
+        self.title = ""
+        self.imdb_id = ""
+        self.total_episodes = 0
+        self.downloaded_episodes = 0
+        self.completed = False
+        self.failed_episodes = []
+        self.season_episode_counts = {}
+        self.selected_episodes = []      # list of [season, episode]
+        self.start_time = None
+        self.download_folder = MOVIES_FOLDER
+        self.owner_id = 0
+        self.channel_id = 0
+        # Options remembered
+        self.quality_choice = "1"
+        self.additional_choice = "3"
+        self.subtitles = False
+        self.upscale = False
+
+    def save(self):
+        try:
+            with open(os.path.join(self.download_folder, PROGRESS_FILE), 'wb') as f:
+                pickle.dump(self, f)
+        except Exception as e:
+            print(f"[progress save] {e}")
+
+    @staticmethod
+    def load():
+        try:
+            with open(os.path.join(MOVIES_FOLDER, PROGRESS_FILE), 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+
+    def percent(self):
+        if self.total_episodes == 0:
+            return 0
+        return (self.downloaded_episodes / self.total_episodes) * 100
+
+
+def save_state(**kwargs):
+    try:
+        state = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        state.update(kwargs)
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[save_state] {e}")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# =============================================================
+# IMDb helpers
+# =============================================================
+def classify(q):
+    q = (q or "").strip().lower()
+    if "series" in q:
+        return "series"
+    if q in ("tv movie", "movie", "video", "short"):
+        return "movie"
+    if "tv" in q:
+        return "movie"
+    return "unknown"
+
+
+def search_imdb(query, limit=5):
+    if not query:
+        return []
+    c = query[0].lower() if query[0].isalnum() else "a"
+    url = f"https://v2.sg.media-imdb.com/suggestion/{c}/{query}.json"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[imdb search] {e}")
+        return []
+    return [x for x in data.get('d', []) if x.get('id', '').startswith('tt')][:limit]
+
+
+def get_series_info(imdb_id):
+    seasons = {}
+    try:
+        r = requests.get(f"https://www.imdb.com/title/{imdb_id}/episodes",
+                         headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        text = r.text
+    except Exception as e:
+        print(f"[imdb episodes] {e}")
+        return {}
+
+    season_nums = []
+    for pat in [
+        r'<option[^>]*value="(\d+)"[^>]*>',
+        r'data-season-number="(\d+)"',
+        r'Season\s+(\d+)',
+    ]:
+        found = re.findall(pat, text)
+        if found:
+            season_nums = sorted({int(s) for s in found if str(s).isdigit()})
+            break
+
+    for s in season_nums:
+        try:
+            sr = requests.get(
+                f"https://www.imdb.com/title/{imdb_id}/episodes?season={s}",
+                headers=HEADERS, timeout=15)
+            sr.raise_for_status()
+            st = sr.text
+        except Exception:
+            continue
+
+        count = 0
+        c = re.findall(r'episode-container', st)
+        if c:
+            count = len(c)
+        else:
+            c = re.findall(rf'/title/tt\d+/episodes\?season={s}&episode=(\d+)', st)
+            if c:
+                count = len(set(c))
+            else:
+                c = re.findall(r'itemprop="episode"', st)
+                if c:
+                    count = len(c)
+        if count > 0:
+            seasons[s] = count
+    return seasons
+
+
+# =============================================================
+# Download helpers
+# =============================================================
+def construct_vidcore_url(imdb_id, is_series=False, season=1, episode=1):
+    if is_series:
+        return f"https://vidcore.io/tv/{imdb_id}/{season}/{episode}"
+    return f"https://vidcore.io/movie/{imdb_id}"
+
+
+def check_internet():
+    try:
+        requests.get("https://www.google.com", timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def is_4k_source(path):
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=height', '-of', 'csv=p=0', path],
+            capture_output=True, text=True, timeout=30)
+        if probe.returncode == 0 and probe.stdout.strip().isdigit():
+            return int(probe.stdout.strip()) >= 2160
+    except Exception:
+        pass
+    return False
+
+
+def upscale_to_4k(input_file, status_cb=None, delete_source=True):
+    """
+    Upscale to 4K. Deletes the non-4K source on success (if delete_source).
+    Returns the path of the 4K file, or None on failure.
+    """
+    if not os.path.exists(input_file):
+        if status_cb: status_cb(f"❌ File not found: {input_file}")
+        return None
+
+    if is_4k_source(input_file):
+        if status_cb: status_cb(f"⏭️ Already 4K: {os.path.basename(input_file)}")
+        return input_file
+
+    base, ext = os.path.splitext(input_file)
+    output_file = f"{base}_4k{ext}"
+
+    if status_cb: status_cb(f"🔼 Upscaling {os.path.basename(input_file)} to 4K…")
+
+    cmd = [
+        'ffmpeg', '-i', input_file,
+        '-vf', 'scale=3840:2160:flags=lanczos',
+        '-c:v', 'libx264',
+        '-crf', '18', '-preset', 'faster',
+        '-c:a', 'copy',
+        '-y', output_file
+    ]
+
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, bufsize=1)
+    except FileNotFoundError:
+        if status_cb: status_cb("❌ FFmpeg not found.")
+        return None
+
+    q = queue.Queue()
+    def reader():
+        for line in iter(process.stderr.readline, ''):
+            if line: q.put(line.rstrip())
+        process.stderr.close()
+    threading.Thread(target=reader, daemon=True).start()
+
+    last = -1
+    while process.poll() is None or not q.empty():
+        try:
+            line = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        m = re.search(r'time=(\d+):(\d+):(\d+)', line)
+        if m:
+            h, mn, s = map(int, m.groups())
+            secs = h * 3600 + mn * 60 + s
+            if secs - last >= 30:
+                last = secs
+                if status_cb:
+                    status_cb(f"🔼 Upscaling… {h:02d}:{mn:02d}:{s:02d} encoded")
+
+    if process.returncode != 0:
+        if status_cb: status_cb("❌ Upscaling failed.")
+        return None
+
+    if not os.path.exists(output_file) or os.path.getsize(output_file) < 1024 * 1024:
+        if status_cb: status_cb("❌ Upscaled file is missing or too small.")
+        return None
+
+    if status_cb: status_cb(f"✅ Upscaled: {os.path.basename(output_file)}")
+
+    if delete_source:
+        try:
+            os.remove(input_file)
+            if status_cb:
+                status_cb(f"🗑️ Deleted original: {os.path.basename(input_file)}")
+        except Exception as e:
+            if status_cb:
+                status_cb(f"⚠️ Could not delete original: {e}")
+
+    return output_file
+
+
+# =============================================================
+# Per-episode download (runs in a thread)
+# =============================================================
+def download_one(url, title, episode_info, progress, notify, loop,
+                 is_movie=False, retry=0):
+
+    def say(msg):
+        asyncio.run_coroutine_threadsafe(notify(msg), loop)
+
+    max_retries = 3
+
+    header = ""
+    if episode_info:
+        header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
+    elif is_movie:
+        header = "🎬 Movie"
+    say(f"{header} — starting")
+
+    if not check_internet():
+        say("🌐 No internet, waiting…")
+        waited = 0
+        while waited < 300 and not check_internet():
+            time.sleep(5); waited += 5
+        if not check_internet():
+            say("❌ Still offline, skipping.")
+            return False
+
+    subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
+    time.sleep(2)
+
+    chrome_process = subprocess.Popen([
+        CHROME_PATH,
+        f"--user-data-dir={CHROME_USER_DATA}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-features=CalculateNativeWinOcclusion",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-session-crashed-bubble",
+        "--hide-crash-restore-bubble",
+        url
+    ])
+
+    m3u8_url = None
+    last_clip = ""
+    max_wait = 120
+    for attempt in range(max_wait):
+        try:
+            import pyperclip
+            clip = pyperclip.paste()
+        except Exception:
+            clip = ""
+        if clip and clip != last_clip and ".m3u8" in clip and clip.startswith("http"):
+            m3u8_url = clip
+            break
+        last_clip = clip
+        if attempt % 20 == 0:
+            say(f"⏳ waiting for m3u8 URL… ({attempt}s)")
+        time.sleep(1)
+
+    try:
+        chrome_process.terminate()
+        time.sleep(1)
+        subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
+    except Exception:
+        pass
+
+    if not m3u8_url:
+        if retry < max_retries:
+            say(f"🔄 Retrying… ({retry+1}/{max_retries})")
+            time.sleep(3)
+            return download_one(url, title, episode_info, progress,
+                                notify, loop, is_movie, retry + 1)
+        if is_movie and "movie" in url:
+            imdb_id = url.split("/movie/")[-1]
+            series_url = f"https://vidcore.io/tv/{imdb_id}/1/1"
+            say(f"🔄 Trying series URL: {series_url}")
+            return download_one(series_url, title,
+                                {"season": 1, "episode": 1},
+                                progress, notify, loop, False, 0)
+        say("❌ Could not capture m3u8 URL.")
+        return False
+
+    say("✅ m3u8 captured")
+
+    quality_map = {
+        "1": "bestvideo+bestaudio/best",
+        "2": "bestvideo[height>=2160]+bestaudio/best",
+        "3": "bestvideo[height>=1080]+bestaudio/best",
+        "4": "bestvideo[height>=720]+bestaudio/best",
+        "5": "bestvideo[height>=480]+bestaudio/best",
+        "6": "bestaudio/best",
+    }
+    fmt = quality_map.get(progress.quality_choice, "bestvideo+bestaudio/best")
+
+    yt_cmd = [
+        PYTHON_PATH, "-m", YTDLP_MODULE,
+        "--referer", "https://vidcore.io/",
+        "--cookies-from-browser", "chromium",
+        m3u8_url,
+    ]
+
+    if progress.additional_choice == "1":
+        yt_cmd += ["-f", fmt.replace("+bestaudio", "")]
+    elif progress.additional_choice == "2":
+        yt_cmd += ["-f", "bestaudio/best"]
+    else:
+        yt_cmd += ["-f", fmt]
+
+    if progress.additional_choice != "2":
+        yt_cmd += ["--merge-output-format", "mkv"]
+
+    if progress.subtitles:
+        yt_cmd += ["--write-subs", "--sub-lang", "en"]
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if title:
+        safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
+        if episode_info:
+            filename = (f"{safe}_S{episode_info['season']:02d}"
+                        f"E{episode_info['episode']:02d}_Q{progress.quality_choice}.%(ext)s")
+        else:
+            filename = f"{safe}_{ts}_Q{progress.quality_choice}.%(ext)s"
+    else:
+        filename = f"video_{ts}.%(ext)s"
+
+    out_path = os.path.join(MOVIES_FOLDER, filename)
+    yt_cmd += ["-o", out_path, "--progress", "--newline"]
+
+    say("📥 Downloading…")
+
+    try:
+        process = subprocess.Popen(yt_cmd,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, bufsize=1)
+    except Exception as e:
+        say(f"❌ yt-dlp failed to start: {e}")
+        return False
+
+    q = queue.Queue()
+    def reader(stream, name):
+        for line in iter(stream.readline, ''):
+            if line: q.put((name, line.rstrip()))
+        stream.close()
+    threading.Thread(target=reader, args=(process.stdout, "out"), daemon=True).start()
+    threading.Thread(target=reader, args=(process.stderr, "err"), daemon=True).start()
+
+    last_update = time.time()
+    while process.poll() is None or not q.empty():
+        try:
+            _, line = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if "[download]" in line or "ETA" in line:
+            if time.time() - last_update >= 10:
+                say(f"⏳ {line.strip()[:150]}")
+                last_update = time.time()
+        elif "ERROR" in line:
+            say(f"⚠️ {line.strip()[:200]}")
+
+    if process.returncode != 0:
+        if retry < max_retries:
+            say(f"🔄 yt-dlp failed, retrying… ({retry+1}/{max_retries})")
+            time.sleep(3)
+            return download_one(url, title, episode_info, progress,
+                                notify, loop, is_movie, retry + 1)
+        say("❌ yt-dlp failed permanently.")
+        return False
+
+    say(f"✅ Downloaded: {filename}")
+
+    if progress.upscale and progress.additional_choice != "2" \
+            and progress.quality_choice in ("1", "2", "3"):
+        prefix = filename.replace(".%(ext)s", "")
+        for f in os.listdir(MOVIES_FOLDER):
+            if f.startswith(prefix):
+                full = os.path.join(MOVIES_FOLDER, f)
+                upscale_to_4k(full, status_cb=say, delete_source=True)
+                break
+
+    return True
+
+
+# =============================================================
+# Selection parser
+# =============================================================
+def parse_selection(user_input, seasons):
+    s = (user_input or "").strip().lower()
+    if s == "all":
+        return [(sn, ep) for sn in sorted(seasons) for ep in range(1, seasons[sn] + 1)]
+
+    result = []
+
+    def parse_part(part):
+        part = part.strip()
+        if not part:
+            return None
+        if "-" in part:
+            a, b = part.split("-", 1)
+            if not (a.isdigit() and b.isdigit()):
+                return None
+            return list(range(int(a), int(b) + 1))
+        if "," in part:
+            if not all(x.isdigit() for x in part.split(",")):
+                return None
+            return [int(x) for x in part.split(",")]
+        if part.isdigit():
+            return [int(part)]
+        return None
+
+    if ":" in s:
+        for chunk in s.split(";"):
+            if ":" not in chunk:
+                return None
+            season_str, eps_str = chunk.split(":", 1)
+            if not season_str.isdigit():
+                return None
+            season = int(season_str)
+            if season not in seasons:
+                return None
+            eps = parse_part(eps_str)
+            if not eps:
+                return None
+            for e in eps:
+                if 1 <= e <= seasons[season]:
+                    result.append((season, e))
+        return result
+
+    for chunk in s.replace(",", " ").split():
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            if not (a.isdigit() and b.isdigit()):
+                return None
+            for sn in range(int(a), int(b) + 1):
+                if sn in seasons:
+                    for ep in range(1, seasons[sn] + 1):
+                        result.append((sn, ep))
+        elif chunk.isdigit():
+            sn = int(chunk)
+            if sn in seasons:
+                for ep in range(1, seasons[sn] + 1):
+                    result.append((sn, ep))
+        else:
+            return None
+
+    return result
+
+
+# =============================================================
+# UI — dropdowns + buttons, in-channel, restricted to the requester
+# =============================================================
+class OwnerRestrictedView(discord.ui.View):
+    """A View that only its original requester can interact with."""
+    def __init__(self, owner_id, timeout=120):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.answer = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ Only the requester can answer this.", ephemeral=True)
+            return False
+        return True
+
+
+class QualitySelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Choose quality…",
+            options=[
+                discord.SelectOption(label="Best available", value="1",
+                                     description="Auto-select the highest quality"),
+                discord.SelectOption(label="4K (2160p)", value="2"),
+                discord.SelectOption(label="1080p", value="3"),
+                discord.SelectOption(label="720p", value="4"),
+                discord.SelectOption(label="480p", value="5"),
+                discord.SelectOption(label="Audio only", value="6"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.answer = self.values[0]
+        await interaction.response.defer()
+        self.view.stop()
+
+
+class QualityView(OwnerRestrictedView):
+    def __init__(self, owner_id):
+        super().__init__(owner_id)
+        self.add_item(QualitySelect())
+
+
+class ModeSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Video / audio / both?",
+            options=[
+                discord.SelectOption(label="Video + audio (default)", value="3"),
+                discord.SelectOption(label="Video only", value="1"),
+                discord.SelectOption(label="Audio only", value="2"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.answer = self.values[0]
+        await interaction.response.defer()
+        self.view.stop()
+
+
+class ModeView(OwnerRestrictedView):
+    def __init__(self, owner_id):
+        super().__init__(owner_id)
+        self.add_item(ModeSelect())
+
+
+class YesNoView(OwnerRestrictedView):
+    def __init__(self, owner_id, prompt_yes="Yes", prompt_no="No"):
+        super().__init__(owner_id)
+        yes = discord.ui.Button(label=prompt_yes, style=discord.ButtonStyle.success)
+        no  = discord.ui.Button(label=prompt_no,  style=discord.ButtonStyle.secondary)
+        yes.callback = self._yes
+        no.callback  = self._no
+        self.add_item(yes)
+        self.add_item(no)
+
+    async def _yes(self, interaction):
+        self.answer = True
+        await interaction.response.defer()
+        self.stop()
+
+    async def _no(self, interaction):
+        self.answer = False
+        await interaction.response.defer()
+        self.stop()
+
+
+async def ask_quality_in_channel(ctx):
+    view = QualityView(ctx.author.id)
+    msg = await ctx.send("🎚️ **Quality?**", view=view)
+    await view.wait()
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    return view.answer or "1"
+
+
+async def ask_mode_in_channel(ctx):
+    view = ModeView(ctx.author.id)
+    msg = await ctx.send("📼 **Download mode?**", view=view)
+    await view.wait()
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    return view.answer or "3"
+
+
+async def ask_yesno_in_channel(ctx, text):
+    view = YesNoView(ctx.author.id)
+    msg = await ctx.send(text, view=view)
+    await view.wait()
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    return bool(view.answer)
+
+
+# =============================================================
+# Runners
+# =============================================================
+async def notify(channel, msg):
+    try:
+        await channel.send(msg)
+    except Exception as e:
+        print(f"[notify] {e}")
+
+
+async def run_series(ctx, info, options, selection):
+    imdb_id = info["imdb_id"]
+    title = info["title"]
+    seasons = info["seasons"]
+
+    progress = DownloadProgress()
+    progress.title = title
+    progress.imdb_id = imdb_id
+    progress.season_episode_counts = seasons
+    progress.selected_episodes = selection
+    progress.total_episodes = len(selection)
+    progress.start_time = time.time()
+    progress.quality_choice = options["quality"]
+    progress.additional_choice = options["additional"]
+    progress.subtitles = options["subtitles"]
+    progress.upscale = options["upscale"]
+    progress.owner_id = ctx.author.id
+    progress.channel_id = ctx.channel.id
+    progress.save()
+
+    save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
+
+    await ctx.send(
+        f"▶️ Starting **{title}** — {len(selection)} episodes, "
+        f"Q{options['quality']}, upscale={'on' if options['upscale'] else 'off'}"
+    )
+
+    loop = asyncio.get_running_loop()
+    all_ok = True
+
+    for season, episode in selection:
+        url = construct_vidcore_url(imdb_id, True, season, episode)
+        ep_info = {"season": season, "episode": episode}
+
+        ok = await asyncio.to_thread(
+            download_one,
+            url, title, ep_info, progress,
+            lambda m: notify(ctx.channel, m),
+            loop, False, 0
+        )
+
+        if ok:
+            progress.downloaded_episodes += 1
+        else:
+            progress.failed_episodes.append(ep_info)
+            all_ok = False
+        progress.save()
+
+        await ctx.send(
+            f"📊 Progress: {progress.percent():.1f}% "
+            f"({progress.downloaded_episodes}/{progress.total_episodes})"
+        )
+
+    progress.completed = all_ok
+    progress.save()
+
+    if all_ok:
+        await ctx.send(f"🎉 **{title}** — all selected episodes downloaded!")
+    else:
+        failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
+        await ctx.send(f"⚠️ **{title}** — done with failures: {failed}")
+
+    # ---- The ONLY DM: job finished ----
+    try:
+        dm = await ctx.author.create_dm()
+        if all_ok:
+            await dm.send(
+                f"🎉 Done!\n**{title}** — "
+                f"{progress.downloaded_episodes}/{progress.total_episodes} episodes downloaded."
+            )
+        else:
+            await dm.send(
+                f"⚠️ Finished with errors.\n**{title}** — "
+                f"{progress.downloaded_episodes}/{progress.total_episodes} downloaded, "
+                f"{len(progress.failed_episodes)} failed: "
+                + ", ".join(f"S{e['season']}E{e['episode']}"
+                            for e in progress.failed_episodes)
+            )
+    except Exception as e:
+        print(f"[dm] {e}")
+
+
+async def run_movie(ctx, info, options):
+    imdb_id = info["imdb_id"]
+    title = info["title"]
+
+    progress = DownloadProgress()
+    progress.title = title
+    progress.imdb_id = imdb_id
+    progress.quality_choice = options["quality"]
+    progress.additional_choice = options["additional"]
+    progress.subtitles = options["subtitles"]
+    progress.upscale = options["upscale"]
+    progress.owner_id = ctx.author.id
+    progress.channel_id = ctx.channel.id
+    progress.save()
+
+    save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
+
+    loop = asyncio.get_running_loop()
+    url = construct_vidcore_url(imdb_id, False)
+
+    ok = await asyncio.to_thread(
+        download_one,
+        url, title, None, progress,
+        lambda m: notify(ctx.channel, m),
+        loop, True, 0
+    )
+
+    if ok:
+        await ctx.send(f"🎉 **{title}** — downloaded!")
+    else:
+        await ctx.send(f"⚠️ **{title}** — failed.")
+
+    try:
+        dm = await ctx.author.create_dm()
+        if ok:
+            await dm.send(f"🎉 Done!\n**{title}** downloaded successfully.")
+        else:
+            await dm.send(f"⚠️ **{title}** — download failed.")
+    except Exception as e:
+        print(f"[dm] {e}")
+
+
+# =============================================================
+# Bot events
+# =============================================================
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
+
+    # Auto-resume any unfinished job
+    p = DownloadProgress.load()
+    if not p or p.completed:
+        return
+
+    state = load_state()
+    channel_id = state.get("channel_id") or p.channel_id
+    owner_id = state.get("owner_id") or p.owner_id
+    if not channel_id:
+        print("[resume] No saved channel — skipping auto-resume.")
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            print(f"[resume] Channel not found: {e}")
+            return
+
+    await channel.send(
+        f"♻️ Auto-resuming **{p.title}** "
+        f"({p.downloaded_episodes}/{p.total_episodes} done)"
+    )
+
+    info = {"imdb_id": p.imdb_id, "title": p.title, "seasons": p.season_episode_counts}
+    opts = {
+        "quality": p.quality_choice,
+        "additional": p.additional_choice,
+        "subtitles": p.subtitles,
+        "upscale": p.upscale,
+    }
+
+    class _User:
+        def __init__(self, uid):
+            self.id = uid
+        async def create_dm(self):
+            return await bot.create_dm(discord.Object(id=self.id))
+
+    class _Ctx:
+        def __init__(self, ch, uid):
+            self.channel = ch
+            self.author = _User(uid)
+        async def send(self, m):
+            await self.channel.send(m)
+
+    selection = p.selected_episodes or \
+        [(s, e) for s in sorted(p.season_episode_counts)
+         for e in range(1, p.season_episode_counts[s] + 1)]
+
+    asyncio.create_task(run_series(_Ctx(channel, owner_id), info, opts, selection))
+
+
+# =============================================================
+# Commands
+# =============================================================
+@bot.command(name="dl")
+async def dl(ctx, *, query: str):
+    if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
+        await ctx.send("⛔ Not authorized.")
+        return
+
+    if ctx.author.id in active_jobs and not active_jobs[ctx.author.id].done():
+        await ctx.send("⚠️ You already have a job running.")
+        return
+
+    await ctx.send(f"🔍 Searching IMDb for `{query}`…")
+    results = search_imdb(query, limit=5)
+    if not results:
+        await ctx.send("❌ No results.")
+        return
+
+    lines = []
+    for i, r in enumerate(results, 1):
+        cat = classify(r.get('q', ''))
+        lines.append(f"{i}. `{r.get('id')}` — {r.get('l')} ({r.get('y','?')}) [{cat}]")
+    await ctx.send("**Results:**\n" + "\n".join(lines) +
+                   "\nReply with the number (or `0` to cancel).")
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    try:
+        msg = await bot.wait_for("message", check=check, timeout=60)
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ Timed out.")
+        return
+
+    if msg.content.strip() == "0":
+        await ctx.send("Cancelled.")
+        return
+
+    try:
+        idx = int(msg.content.strip()) - 1
+        result = results[idx]
+    except Exception:
+        await ctx.send("❌ Invalid selection.")
+        return
+
+    imdb_id = result.get("id")
+    title = result.get("l")
+    category = classify(result.get("q", ""))
+
+    await ctx.send(f"📋 **{title}** — `{imdb_id}` — {category}")
+
+    # ---- Options in-channel with dropdowns/buttons ----
+    quality    = await ask_quality_in_channel(ctx)
+    additional = await ask_mode_in_channel(ctx)
+    subs       = await ask_yesno_in_channel(ctx, "💬 **Download subtitles?**")
+    upscale    = await ask_yesno_in_channel(ctx, "🔼 **Upscale to 4K if not already 4K?**")
+
+    options = {
+        "quality": quality,
+        "additional": additional,
+        "subtitles": subs,
+        "upscale": upscale,
+    }
+
+    info = {"imdb_id": imdb_id, "title": title, "type": category}
+
+    if category == "series":
+        await ctx.send("📺 Fetching seasons/episodes…")
+        seasons = await asyncio.to_thread(get_series_info, imdb_id)
+        if not seasons:
+            await ctx.send("⚠️ Could not auto-detect — manual entry in channel.")
+            seasons = {}
+            await ctx.send("📝 Send each season as `1 6` "
+                           "(season 1, 6 episodes). Type `done` to finish.")
+            while True:
+                try:
+                    m = await bot.wait_for("message", check=check, timeout=120)
+                except asyncio.TimeoutError:
+                    break
+                if m.content.strip().lower() == "done":
+                    break
+                parts = m.content.strip().split()
+                if len(parts) == 2 and all(p.isdigit() for p in parts):
+                    seasons[int(parts[0])] = int(parts[1])
+                    await ctx.send(f"✔️ Season {parts[0]}: {parts[1]} eps")
+                else:
+                    await ctx.send("❌ Try `1 6` or `done`.")
+            if not seasons:
+                await ctx.send("❌ Aborting — no seasons.")
+                return
+
+        info["seasons"] = seasons
+
+        lines = [f"**{title}** — available:"]
+        for sn in sorted(seasons):
+            lines.append(f"• Season {sn}: {seasons[sn]} episodes")
+        await ctx.send("\n".join(lines))
+
+        await ctx.send(
+            "🎯 **Which episodes?** Reply with one of:\n"
+            "`all` = everything\n"
+            "`2` = only season 2\n"
+            "`1 3` = seasons 1 and 3\n"
+            "`1-2` = seasons 1 through 2\n"
+            "`2:3-5` = season 2, episodes 3 to 5\n"
+            "`2:1,3` = season 2, episodes 1 and 3"
+        )
+        try:
+            m = await bot.wait_for("message", check=check, timeout=120)
+        except asyncio.TimeoutError:
+            await ctx.send("⏰ Timed out.")
+            return
+
+        selection = parse_selection(m.content, seasons)
+        if not selection:
+            await ctx.send("❌ Could not parse selection. Aborting.")
+            return
+
+        await ctx.send(f"▶️ {len(selection)} episodes selected. Starting…")
+
+        task = asyncio.create_task(run_series(ctx, info, options, selection))
+        active_jobs[ctx.author.id] = task
+        await task
+        active_jobs.pop(ctx.author.id, None)
+
+    else:
+        task = asyncio.create_task(run_movie(ctx, info, options))
+        active_jobs[ctx.author.id] = task
+        await task
+        active_jobs.pop(ctx.author.id, None)
+
+
+@bot.command(name="status")
+async def status(ctx):
+    if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
+        return
+    p = DownloadProgress.load()
+    if not p:
+        await ctx.send("📭 No saved progress.")
+        return
+    await ctx.send(
+        f"📊 **{p.title}** — {p.percent():.1f}% "
+        f"({p.downloaded_episodes}/{p.total_episodes})"
+        + (f"\n❌ Failed: {len(p.failed_episodes)}" if p.failed_episodes else "")
+    )
+
+
+@bot.command(name="cancel")
+async def cancel(ctx):
+    if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
+        return
+    task = active_jobs.get(ctx.author.id)
+    if task and not task.done():
+        task.cancel()
+        await ctx.send("🛑 Cancelled.")
+    else:
+        await ctx.send("Nothing running.")
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
