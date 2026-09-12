@@ -1,0 +1,286 @@
+// ==UserScript==
+// @name         VidCore M3U8 Auto-Copier (Enhanced)
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Aggressively capture m3u8 URLs from VidCore
+// @author       You
+// @match        https://vidcore.io/tv/*
+// @match        https://*.vidcore.io/tv/*
+// @grant        GM_setClipboard
+// @grant        GM_notification
+// @grant        unsafeWindow
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    console.log('🎬 VidCore M3U8 Auto-Copier (Enhanced) loaded!');
+
+    let m3u8Found = false;
+    let processedUrls = new Set();
+    let urlFound = null;
+
+    // Function to handle m3u8 URL
+    function handleM3u8Url(url) {
+        if (!url || typeof url !== 'string') return;
+        if (!url.includes('.m3u8')) return;
+        if (!url.startsWith('http')) return;
+        if (processedUrls.has(url)) return;
+
+        console.log('🔴 M3U8 Found:', url);
+        processedUrls.add(url);
+        urlFound = url;
+
+        // Copy to clipboard
+        try {
+            GM_setClipboard(url);
+            console.log('✅ URL copied to clipboard!');
+
+            // Show notification
+            showNotification('✅ M3U8 URL Copied!', url);
+
+            // Also store in window for debugging
+            window.__m3u8Url = url;
+
+        } catch(e) {
+            console.error('Failed to copy:', e);
+        }
+    }
+
+    // Show notification
+    function showNotification(title, url) {
+        try {
+            GM_notification({
+                title: title,
+                text: url.substring(0, 80) + '...',
+                timeout: 5000
+            });
+        } catch(e) {}
+
+        // Also show DOM notification
+        const div = document.createElement('div');
+        div.style.cssText = `
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: #4CAF50;
+            color: white;
+            padding: 15px 25px;
+            border-radius: 8px;
+            z-index: 999999;
+            font-size: 14px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            font-family: Arial, sans-serif;
+            max-width: 500px;
+            word-break: break-all;
+        `;
+        div.innerHTML = `
+            <div style="font-weight: bold; margin-bottom: 5px;">${title}</div>
+            <div style="font-size: 12px; opacity: 0.9;">${url}</div>
+        `;
+        document.body.appendChild(div);
+        setTimeout(() => {
+            div.style.opacity = '0';
+            div.style.transition = 'opacity 0.5s';
+            setTimeout(() => div.remove(), 500);
+        }, 8000);
+    }
+
+    // Method 1: Override fetch
+    const originalFetch = window.fetch;
+    window.fetch = function(input, init) {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url && url.includes('.m3u8')) {
+            handleM3u8Url(url);
+        }
+        return originalFetch.call(this, input, init);
+    };
+
+    // Method 2: Override XMLHttpRequest
+    const OriginalXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = function() {
+        const xhr = new OriginalXHR();
+        const originalOpen = xhr.open;
+        const originalSend = xhr.send;
+
+        xhr.open = function(method, url, ...rest) {
+            this._url = url;
+            if (url && url.includes('.m3u8')) {
+                handleM3u8Url(url);
+            }
+            return originalOpen.call(this, method, url, ...rest);
+        };
+
+        xhr.send = function(body) {
+            return originalSend.call(this, body);
+        };
+
+        return xhr;
+    };
+
+    // Method 3: Override XMLHttpRequest.send for POST requests
+    const OriginalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function(body) {
+        if (this._url && this._url.includes('.m3u8')) {
+            handleM3u8Url(this._url);
+        }
+        return OriginalSend.call(this, body);
+    };
+
+    // Method 4: Override WebSocket (if used)
+    const OriginalWebSocket = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        if (url && url.includes('.m3u8')) {
+            handleM3u8Url(url);
+        }
+        return new OriginalWebSocket(url, protocols);
+    };
+
+    // Method 5: Override EventSource
+    const OriginalEventSource = window.EventSource;
+    window.EventSource = function(url, eventSourceInitDict) {
+        if (url && url.includes('.m3u8')) {
+            handleM3u8Url(url);
+        }
+        return new OriginalEventSource(url, eventSourceInitDict);
+    };
+
+    // Method 6: Check for video src changes
+    const observer = new MutationObserver(() => {
+        document.querySelectorAll('video, source').forEach(el => {
+            let src = el.src || el.getAttribute('src');
+            if (src && src.includes('.m3u8')) {
+                handleM3u8Url(src);
+            }
+        });
+    });
+
+    // Method 7: Monitor HLS.js and other players
+    function monitorPlayers() {
+        // Check for HLS.js
+        if (window.Hls) {
+            console.log('🎬 HLS.js detected');
+            const origLoad = window.Hls.prototype.loadSource;
+            if (origLoad) {
+                window.Hls.prototype.loadSource = function(url) {
+                    if (url && url.includes('.m3u8')) {
+                        handleM3u8Url(url);
+                    }
+                    return origLoad.call(this, url);
+                };
+            }
+        }
+
+        // Check for Video.js
+        if (window.videojs) {
+            console.log('🎬 Video.js detected');
+        }
+
+        // Check for JWPlayer
+        if (window.jwplayer) {
+            console.log('🎬 JWPlayer detected');
+        }
+
+        // Check for Shaka Player
+        if (window.shaka) {
+            console.log('🎬 Shaka Player detected');
+        }
+    }
+
+    // Method 8: Monitor fetch requests via CDP (for Chrome)
+    function monitorNetwork() {
+        try {
+            // Check if we can access network logs
+            const logs = performance.getEntriesByType('resource');
+            logs.forEach(entry => {
+                if (entry.name && entry.name.includes('.m3u8')) {
+                    handleM3u8Url(entry.name);
+                }
+            });
+        } catch(e) {}
+
+        // Monitor new network requests
+        if (window.PerformanceObserver) {
+            const observer = new PerformanceObserver((list) => {
+                list.getEntries().forEach(entry => {
+                    if (entry.name && entry.name.includes('.m3u8')) {
+                        handleM3u8Url(entry.name);
+                    }
+                });
+            });
+            observer.observe({ entryTypes: ['resource'] });
+        }
+    }
+
+    // Method 9: Check clipboard for m3u8 URLs (from other sources)
+    function monitorClipboard() {
+        let lastClipboard = '';
+        setInterval(() => {
+            try {
+                // This won't work in all browsers, but worth a try
+                if (navigator.clipboard) {
+                    navigator.clipboard.readText().then(text => {
+                        if (text && text !== lastClipboard && text.includes('.m3u8')) {
+                            lastClipboard = text;
+                            handleM3u8Url(text);
+                        }
+                    }).catch(() => {});
+                }
+            } catch(e) {}
+        }, 2000);
+    }
+
+    // Wait for DOM
+    document.addEventListener('DOMContentLoaded', () => {
+        console.log('📄 DOM loaded, starting observers...');
+
+        // Start observing
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['src']
+        });
+
+        // Monitor players
+        setTimeout(monitorPlayers, 1000);
+
+        // Monitor network
+        setTimeout(monitorNetwork, 500);
+
+        // Monitor clipboard
+        setTimeout(monitorClipboard, 2000);
+    });
+
+    // Also check immediately
+    setTimeout(() => {
+        // Check existing video elements
+        document.querySelectorAll('video, source').forEach(el => {
+            let src = el.src || el.getAttribute('src');
+            if (src && src.includes('.m3u8')) {
+                handleM3u8Url(src);
+            }
+        });
+
+        // Check resource entries
+        try {
+            performance.getEntriesByType('resource').forEach(entry => {
+                if (entry.name && entry.name.includes('.m3u8')) {
+                    handleM3u8Url(entry.name);
+                }
+            });
+        } catch(e) {}
+    }, 1000);
+
+    // Method 10: Listen for messages from Stream Detector
+    window.addEventListener('message', function(event) {
+        if (event.data && event.data.type === 'stream-detector' && event.data.url) {
+            if (event.data.url.includes('.m3u8')) {
+                handleM3u8Url(event.data.url);
+            }
+        }
+    });
+
+    console.log('🎬 All interceptors active!');
+})();

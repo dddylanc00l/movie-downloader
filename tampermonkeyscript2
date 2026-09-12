@@ -1,0 +1,287 @@
+// ==UserScript==
+// @name         VidCore M3U8 Capture (Aggressive)
+// @namespace    http://tampermonkey.net/
+// @version      3.0
+// @description  Aggressively capture ALL m3u8 URLs from VidCore (network + DOM + players)
+// @author       You
+// @match        https://vidcore.io/*
+// @match        https://*.vidcore.io/*
+// @grant        GM_setClipboard
+// @grant        GM_notification
+// @grant        unsafeWindow
+// @run-at       document-start
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    console.log('🎬 VidCore M3U8 Capture (Aggressive) loaded!');
+
+    const seenUrls = new Set();
+    let lastNotified = 0;
+
+    function isM3U8(url) {
+        if (!url || typeof url !== 'string') return false;
+        return url.toLowerCase().includes('.m3u8') && url.startsWith('http');
+    }
+
+    function handleM3U8(url, source) {
+        if (!isM3U8(url)) return;
+        if (seenUrls.has(url)) return;
+        seenUrls.add(url);
+
+        console.log(`🔴 M3U8 [${source}]:`, url);
+
+        try {
+            GM_setClipboard(url);
+            console.log('✅ Copied to clipboard');
+        } catch (e) {
+            console.log('Clipboard failed, using fallback:', e);
+        }
+
+        // Throttle notifications so we don't spam
+        const now = Date.now();
+        if (now - lastNotified > 2000) {
+            lastNotified = now;
+            try {
+                GM_notification({
+                    title: `✅ M3U8 captured (${source})`,
+                    text: url.substring(0, 80) + '...',
+                    timeout: 3000
+                });
+            } catch (e) {}
+        }
+
+        // DOM banner
+        try {
+            const div = document.createElement('div');
+            div.style.cssText = `
+                position: fixed; top: 10px; right: 10px;
+                background: #4CAF50; color: white;
+                padding: 10px 16px; border-radius: 8px;
+                z-index: 999999; font-size: 13px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                font-family: Arial, sans-serif; max-width: 500px;
+                word-break: break-all; pointer-events: none;
+            `;
+            div.innerHTML = `<b>✅ M3U8 (${source})</b><br><small>${url.substring(0, 90)}...</small>`;
+            document.body && document.body.appendChild(div);
+            setTimeout(() => {
+                div.style.transition = 'opacity 0.5s';
+                div.style.opacity = '0';
+                setTimeout(() => div.remove(), 500);
+            }, 3000);
+        } catch (e) {}
+    }
+
+    // ====== 1. Intercept fetch ======
+    const origFetch = unsafeWindow.fetch;
+    unsafeWindow.fetch = function(...args) {
+        try {
+            const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
+            if (isM3U8(url)) handleM3U8(url, 'fetch');
+        } catch (e) {}
+        return origFetch.apply(this, args);
+    };
+
+    // ====== 2. Intercept XMLHttpRequest ======
+    const origOpen = unsafeWindow.XMLHttpRequest.prototype.open;
+    unsafeWindow.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        try {
+            if (isM3U8(url)) handleM3U8(url, 'xhr');
+        } catch (e) {}
+        return origOpen.call(this, method, url, ...rest);
+    };
+
+    // ====== 3. Intercept WebSocket (rare but possible) ======
+    const OrigWS = unsafeWindow.WebSocket;
+    if (OrigWS) {
+        unsafeWindow.WebSocket = function(url, protocols) {
+            try {
+                if (isM3U8(url)) handleM3U8(url, 'websocket');
+            } catch (e) {}
+            return new OrigWS(url, protocols);
+        };
+    }
+
+    // ====== 4. Intercept EventSource ======
+    const OrigES = unsafeWindow.EventSource;
+    if (OrigES) {
+        unsafeWindow.EventSource = function(url, config) {
+            try {
+                if (isM3U8(url)) handleM3U8(url, 'eventsource');
+            } catch (e) {}
+            return new OrigES(url, config);
+        };
+    }
+
+    // ====== 5. Hook HLS.js (very common for VidCore) ======
+    function hookHls() {
+        const Hls = unsafeWindow.Hls;
+        if (!Hls || !Hls.prototype || Hls.prototype.__hooked) return;
+        Hls.prototype.__hooked = true;
+
+        const origLoadSource = Hls.prototype.loadSource;
+        if (origLoadSource) {
+            Hls.prototype.loadSource = function(url) {
+                try {
+                    if (isM3U8(url)) handleM3U8(url, 'hls.js');
+                } catch (e) {}
+                return origLoadSource.apply(this, arguments);
+            };
+        }
+
+        const origLoad = Hls.prototype.load;
+        if (origLoad) {
+            Hls.prototype.load = function() {
+                try {
+                    // Some builds store the URL on the instance
+                    const url = this.url || (this.config && this.config.url);
+                    if (isM3U8(url)) handleM3U8(url, 'hls.js:load');
+                } catch (e) {}
+                return origLoad.apply(this, arguments);
+            };
+        }
+
+        console.log('🎣 HLS.js hooked');
+    }
+
+    // HLS.js may load after our script; poll for it
+    const hlsPoll = setInterval(() => {
+        if (unsafeWindow.Hls) {
+            hookHls();
+            clearInterval(hlsPoll);
+        }
+    }, 500);
+    setTimeout(() => clearInterval(hlsPoll), 30000);
+
+    // ====== 6. Hook Shaka Player ======
+    const shakaPoll = setInterval(() => {
+        const shaka = unsafeWindow.shaka;
+        if (shaka && shaka.Player && shaka.Player.prototype && !shaka.Player.prototype.__hooked) {
+            shaka.Player.prototype.__hooked = true;
+            const origLoad = shaka.Player.prototype.load;
+            if (origLoad) {
+                shaka.Player.prototype.load = function(url) {
+                    try {
+                        if (isM3U8(url)) handleM3U8(url, 'shaka');
+                    } catch (e) {}
+                    return origLoad.apply(this, arguments);
+                };
+            }
+            console.log('🎣 Shaka hooked');
+            clearInterval(shakaPoll);
+        }
+    }, 500);
+    setTimeout(() => clearInterval(shakaPoll), 30000);
+
+    // ====== 7. Hook video/audio element .src and SourceBuffer ======
+    const origSrcDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+    if (origSrcDesc && origSrcDesc.set) {
+        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+            set: function(val) {
+                try {
+                    if (isM3U8(val)) handleM3U8(val, 'media.src');
+                } catch (e) {}
+                return origSrcDesc.set.call(this, val);
+            },
+            get: origSrcDesc.get,
+            configurable: true
+        });
+    }
+
+    // Hook <source> src attribute
+    const origSetAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+        try {
+            if (name === 'src' && this.tagName && this.tagName.toLowerCase() === 'source') {
+                if (isM3U8(value)) handleM3U8(value, 'source.attr');
+            }
+        } catch (e) {}
+        return origSetAttr.call(this, name, value);
+    };
+
+    // ====== 8. Hook MediaSource.addSourceBuffer / URL.createObjectURL ======
+    // (Some sites pass the m3u8 through a blob URL — we can't read those,
+    //  but we can log them for debugging.)
+    const origCreateObjectURL = unsafeWindow.URL && unsafeWindow.URL.createObjectURL;
+    if (origCreateObjectURL) {
+        unsafeWindow.URL.createObjectURL = function(obj) {
+            const url = origCreateObjectURL.call(this, obj);
+            try {
+                console.log('🎬 Blob URL created:', url);
+            } catch (e) {}
+            return url;
+        };
+    }
+
+    // ====== 9. DOM scanner (catches anything already in the DOM) ======
+    function scanDom() {
+        try {
+            document.querySelectorAll('video, source, a[href], iframe').forEach(el => {
+                const candidates = [el.src, el.href, el.getAttribute('src'), el.getAttribute('href')];
+                candidates.forEach(c => {
+                    if (isM3U8(c)) handleM3U8(c, 'dom-scan');
+                });
+            });
+        } catch (e) {}
+    }
+
+    // ====== 10. Performance API scanner (network log) ======
+    // This is the "look in the Network tab" method — PerformanceResourceTiming
+    // contains everything the browser already fetched.
+    function scanPerformance() {
+        try {
+            const entries = performance.getEntriesByType('resource');
+            entries.forEach(entry => {
+                if (isM3U8(entry.name)) handleM3U8(entry.name, 'perf-api');
+            });
+        } catch (e) {}
+    }
+
+    // PerformanceObserver for new entries as they happen
+    try {
+        const po = new PerformanceObserver((list) => {
+            list.getEntries().forEach(entry => {
+                if (isM3U8(entry.name)) handleM3U8(entry.name, 'perf-observer');
+            });
+        });
+        po.observe({ entryTypes: ['resource'] });
+    } catch (e) {
+        console.log('PerformanceObserver not supported:', e);
+    }
+
+    // ====== 11. Periodic scanner (DOM + Performance) ======
+    // Runs every second for the first 2 minutes, then every 5 seconds
+    let tick = 0;
+    const scanInterval = setInterval(() => {
+        tick++;
+        scanDom();
+        scanPerformance();
+        if (tick > 120 && tick % 5 !== 0) return;  // slow down after 2 min
+    }, 1000);
+
+    // ====== 12. Manual trigger via keyboard ======
+    // Press Ctrl+Shift+M to force a scan (useful if you know the video just started)
+    document.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'm') {
+            console.log('🔍 Manual scan triggered');
+            scanDom();
+            scanPerformance();
+            console.log('Known URLs:', Array.from(seenUrls));
+        }
+    });
+
+    // ====== 13. Listen for postMessage (some players broadcast) ======
+    window.addEventListener('message', (e) => {
+        try {
+            const data = typeof e.data === 'string' ? e.data : JSON.stringify(e.data);
+            if (data && data.includes('.m3u8')) {
+                const match = data.match(/https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*/);
+                if (match) handleM3U8(match[0], 'postMessage');
+            }
+        } catch (e) {}
+    });
+
+    console.log('🎬 All interceptors active. Press Ctrl+Shift+M for a manual scan.');
+})();
