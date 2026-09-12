@@ -3,11 +3,12 @@
 VidCore Discord Downloader — Raspberry Pi edition
 - Discord UI with dropdowns + buttons (in-channel)
 - Only the requester can answer the prompts
-- Faster HLS downloads via --concurrent-fragments
-- One editable status message per episode (no channel spam)
-- Auto-upscale to 4K; deletes the non-4K original afterwards
+- Faster HLS downloads via --concurrent-fragments 5
+- One editable status message per episode
+- Auto-upscale to 4K (CRF 18, preset faster); deletes the non-4K original afterward
+- Partial 4K files cleaned up on upscale failure
 - DMs the user ONLY when the job finishes
-- Auto-resumes unfinished series after reboot (skips completed episodes)
+- Auto-resumes unfinished series after reboot, skipping completed episodes
 - Uses Tampermonkey / Stream Detector via the X11 clipboard
 """
 
@@ -77,7 +78,7 @@ class DownloadProgress:
         self.downloaded_episodes = 0
         self.completed = False
         self.failed_episodes = []
-        self.completed_episodes = []       # FIX: track completed (season, episode)
+        self.completed_episodes = []       # FIX: list of [season, episode]
         self.season_episode_counts = {}
         self.selected_episodes = []
         self.start_time = None
@@ -267,6 +268,10 @@ def is_4k_source(path):
 
 
 def upscale_to_4k(input_file, status_cb=None, delete_source=True):
+    """
+    Upscale to 4K. Deletes the non-4K source on success (if delete_source).
+    Returns the path of the 4K file, or None on failure.
+    """
     if not os.path.exists(input_file):
         if status_cb: status_cb(f"❌ File not found: {input_file}")
         return None
@@ -278,14 +283,13 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
     base, ext = os.path.splitext(input_file)
     output_file = f"{base}_4k{ext}"
 
-    if status_cb: status_cb("🔼 Upscaling to 4K…")
+    if status_cb: status_cb(f"🔼 Upscaling {os.path.basename(input_file)} to 4K…")
 
     cmd = [
         'ffmpeg', '-i', input_file,
         '-vf', 'scale=3840:2160:flags=lanczos',
         '-c:v', 'libx264',
-        '-threads', '0',
-        '-crf', '20', '-preset', 'veryfast',   # FIX: 4-5x faster
+        '-crf', '18', '-preset', 'faster',
         '-c:a', 'copy',
         '-y', output_file
     ]
@@ -321,7 +325,7 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
 
     if process.returncode != 0:
         if status_cb: status_cb("❌ Upscaling failed.")
-        # FIX: clean up partial 4K file so resume doesn't get confused
+        # FIX: remove partial _4k file so resume doesn't get confused
         try:
             if os.path.exists(output_file):
                 os.remove(output_file)
@@ -545,12 +549,13 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
 
     set_status(f"✅ downloaded: {filename}", force=True)
 
-    # FIX: verify upscale succeeded before returning True
+    # FIX: only mark episode complete if upscale also succeeded
     if progress.upscale and progress.additional_choice != "2" \
             and progress.quality_choice in ("1", "2", "3"):
         prefix = filename.replace(".%(ext)s", "")
         upscaled_ok = False
         for f in os.listdir(MOVIES_FOLDER):
+            # only pick the non-4K source file
             if f.startswith(prefix) and "_4k" not in f:
                 full = os.path.join(MOVIES_FOLDER, f)
                 result = upscale_to_4k(full,
@@ -767,8 +772,8 @@ async def run_series(ctx, info, options, selection):
     title = info["title"]
     seasons = info["seasons"]
 
+    # FIX: reuse existing progress if it matches this series
     progress = DownloadProgress.load()
-    # If there's no matching saved progress, start fresh
     if not progress or progress.imdb_id != imdb_id or progress.completed:
         progress = DownloadProgress()
 
@@ -792,7 +797,6 @@ async def run_series(ctx, info, options, selection):
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
 
-    # Count already-completed episodes in this selection
     completed_set = {(s, e) for s, e in progress.completed_episodes}
     remaining = [ep for ep in selection if ep not in completed_set]
 
@@ -929,7 +933,6 @@ async def on_ready():
     if not p or p.completed:
         return
 
-    # FIX: backfill in case old pickle lacks the attribute
     if not hasattr(p, "completed_episodes"):
         p.completed_episodes = []
 
