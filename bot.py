@@ -3,9 +3,11 @@
 VidCore Discord Downloader — Raspberry Pi edition
 - Discord UI with dropdowns + buttons (in-channel)
 - Only the requester can answer the prompts
+- Faster HLS downloads via --concurrent-fragments
+- One editable status message per episode (no channel spam)
 - Auto-upscale to 4K; deletes the non-4K original afterwards
 - DMs the user ONLY when the job finishes
-- Auto-resumes unfinished series after reboot
+- Auto-resumes unfinished series after reboot (skips completed episodes)
 - Uses Tampermonkey / Stream Detector via the X11 clipboard
 """
 
@@ -41,6 +43,10 @@ YTDLP_MODULE    = "yt_dlp"
 CHROME_PATH      = "/usr/bin/chromium"
 CHROME_USER_DATA = "/home/grap/.config/chromium"
 
+# Tunables
+CONCURRENT_FRAGMENTS = 5
+STATUS_EDIT_INTERVAL = 8.0
+
 # =============================================================
 # Setup
 # =============================================================
@@ -57,7 +63,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-active_jobs = {}   # user_id -> asyncio.Task
+active_jobs = {}
 
 
 # =============================================================
@@ -71,13 +77,13 @@ class DownloadProgress:
         self.downloaded_episodes = 0
         self.completed = False
         self.failed_episodes = []
+        self.completed_episodes = []       # FIX: track completed (season, episode)
         self.season_episode_counts = {}
-        self.selected_episodes = []      # list of [season, episode]
+        self.selected_episodes = []
         self.start_time = None
         self.download_folder = MOVIES_FOLDER
         self.owner_id = 0
         self.channel_id = 0
-        # Options remembered
         self.quality_choice = "1"
         self.additional_choice = "3"
         self.subtitles = False
@@ -94,9 +100,33 @@ class DownloadProgress:
     def load():
         try:
             with open(os.path.join(MOVIES_FOLDER, PROGRESS_FILE), 'rb') as f:
-                return pickle.load(f)
+                obj = pickle.load(f)
         except Exception:
             return None
+
+        defaults = {
+            "title": "",
+            "imdb_id": "",
+            "total_episodes": 0,
+            "downloaded_episodes": 0,
+            "completed": False,
+            "failed_episodes": [],
+            "completed_episodes": [],       # FIX: backfill for old pickles
+            "season_episode_counts": {},
+            "selected_episodes": [],
+            "start_time": None,
+            "download_folder": MOVIES_FOLDER,
+            "owner_id": 0,
+            "channel_id": 0,
+            "quality_choice": "1",
+            "additional_choice": "3",
+            "subtitles": False,
+            "upscale": False,
+        }
+        for name, default in defaults.items():
+            if not hasattr(obj, name):
+                setattr(obj, name, default)
+        return obj
 
     def percent(self):
         if self.total_episodes == 0:
@@ -110,6 +140,8 @@ def save_state(**kwargs):
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE) as f:
                 state = json.load(f)
+            if not isinstance(state, dict):
+                state = {}
         state.update(kwargs)
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f)
@@ -120,7 +152,8 @@ def save_state(**kwargs):
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -234,10 +267,6 @@ def is_4k_source(path):
 
 
 def upscale_to_4k(input_file, status_cb=None, delete_source=True):
-    """
-    Upscale to 4K. Deletes the non-4K source on success (if delete_source).
-    Returns the path of the 4K file, or None on failure.
-    """
     if not os.path.exists(input_file):
         if status_cb: status_cb(f"❌ File not found: {input_file}")
         return None
@@ -249,13 +278,14 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
     base, ext = os.path.splitext(input_file)
     output_file = f"{base}_4k{ext}"
 
-    if status_cb: status_cb(f"🔼 Upscaling {os.path.basename(input_file)} to 4K…")
+    if status_cb: status_cb("🔼 Upscaling to 4K…")
 
     cmd = [
         'ffmpeg', '-i', input_file,
         '-vf', 'scale=3840:2160:flags=lanczos',
         '-c:v', 'libx264',
-        '-crf', '18', '-preset', 'faster',
+        '-threads', '0',
+        '-crf', '20', '-preset', 'veryfast',   # FIX: 4-5x faster
         '-c:a', 'copy',
         '-y', output_file
     ]
@@ -291,10 +321,21 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
 
     if process.returncode != 0:
         if status_cb: status_cb("❌ Upscaling failed.")
+        # FIX: clean up partial 4K file so resume doesn't get confused
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except Exception:
+            pass
         return None
 
     if not os.path.exists(output_file) or os.path.getsize(output_file) < 1024 * 1024:
-        if status_cb: status_cb("❌ Upscaled file is missing or too small.")
+        if status_cb: status_cb("❌ Upscaled file missing or too small.")
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except Exception:
+            pass
         return None
 
     if status_cb: status_cb(f"✅ Upscaled: {os.path.basename(output_file)}")
@@ -312,9 +353,9 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
 
 
 # =============================================================
-# Per-episode download (runs in a thread)
+# Per-episode download
 # =============================================================
-def download_one(url, title, episode_info, progress, notify, loop,
+def download_one(url, title, episode_info, progress, notify, loop, channel,
                  is_movie=False, retry=0):
 
     def say(msg):
@@ -327,15 +368,37 @@ def download_one(url, title, episode_info, progress, notify, loop,
         header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
     elif is_movie:
         header = "🎬 Movie"
-    say(f"{header} — starting")
+
+    # ---- One editable status message per episode ----
+    status_holder = {}
+    async def _create_status():
+        status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
+    asyncio.run_coroutine_threadsafe(_create_status(), loop).result()
+    status_msg = status_holder["msg"]
+
+    last_edit = 0.0
+    def set_status(text, force=False):
+        nonlocal last_edit
+        now = time.time()
+        if not force and now - last_edit < STATUS_EDIT_INTERVAL:
+            return
+        last_edit = now
+        async def _edit():
+            try:
+                await status_msg.edit(content=f"{header}\n`{text[:180]}`")
+            except Exception as e:
+                print(f"[status edit] {e}")
+        asyncio.run_coroutine_threadsafe(_edit(), loop)
+
+    set_status("starting…", force=True)
 
     if not check_internet():
-        say("🌐 No internet, waiting…")
+        set_status("waiting for internet…", force=True)
         waited = 0
         while waited < 300 and not check_internet():
             time.sleep(5); waited += 5
         if not check_internet():
-            say("❌ Still offline, skipping.")
+            set_status("❌ still offline, skipping", force=True)
             return False
 
     subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
@@ -368,8 +431,7 @@ def download_one(url, title, episode_info, progress, notify, loop,
             m3u8_url = clip
             break
         last_clip = clip
-        if attempt % 20 == 0:
-            say(f"⏳ waiting for m3u8 URL… ({attempt}s)")
+        set_status(f"waiting for m3u8 URL… ({attempt}s)")
         time.sleep(1)
 
     try:
@@ -381,21 +443,21 @@ def download_one(url, title, episode_info, progress, notify, loop,
 
     if not m3u8_url:
         if retry < max_retries:
-            say(f"🔄 Retrying… ({retry+1}/{max_retries})")
+            set_status(f"retrying… ({retry+1}/{max_retries})", force=True)
             time.sleep(3)
             return download_one(url, title, episode_info, progress,
-                                notify, loop, is_movie, retry + 1)
+                                notify, loop, channel, is_movie, retry + 1)
         if is_movie and "movie" in url:
             imdb_id = url.split("/movie/")[-1]
             series_url = f"https://vidcore.io/tv/{imdb_id}/1/1"
-            say(f"🔄 Trying series URL: {series_url}")
+            set_status("trying series URL…", force=True)
             return download_one(series_url, title,
                                 {"season": 1, "episode": 1},
-                                progress, notify, loop, False, 0)
-        say("❌ Could not capture m3u8 URL.")
+                                progress, notify, loop, channel, False, 0)
+        set_status("❌ could not capture m3u8 URL", force=True)
         return False
 
-    say("✅ m3u8 captured")
+    set_status("m3u8 captured, downloading…", force=True)
 
     quality_map = {
         "1": "bestvideo+bestaudio/best",
@@ -411,6 +473,11 @@ def download_one(url, title, episode_info, progress, notify, loop,
         PYTHON_PATH, "-m", YTDLP_MODULE,
         "--referer", "https://vidcore.io/",
         "--cookies-from-browser", "chromium",
+        "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
+        "--fragment-retries", "10",
+        "--retry-sleep", "2",
+        "--http-chunk-size", "10M",
+        "--no-part",
         m3u8_url,
     ]
 
@@ -441,14 +508,12 @@ def download_one(url, title, episode_info, progress, notify, loop,
     out_path = os.path.join(MOVIES_FOLDER, filename)
     yt_cmd += ["-o", out_path, "--progress", "--newline"]
 
-    say("📥 Downloading…")
-
     try:
         process = subprocess.Popen(yt_cmd,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, bufsize=1)
     except Exception as e:
-        say(f"❌ yt-dlp failed to start: {e}")
+        set_status(f"❌ yt-dlp failed to start: {e}", force=True)
         return False
 
     q = queue.Queue()
@@ -459,39 +524,45 @@ def download_one(url, title, episode_info, progress, notify, loop,
     threading.Thread(target=reader, args=(process.stdout, "out"), daemon=True).start()
     threading.Thread(target=reader, args=(process.stderr, "err"), daemon=True).start()
 
-    last_update = time.time()
     while process.poll() is None or not q.empty():
         try:
             _, line = q.get(timeout=0.2)
         except queue.Empty:
             continue
         if "[download]" in line or "ETA" in line:
-            if time.time() - last_update >= 10:
-                say(f"⏳ {line.strip()[:150]}")
-                last_update = time.time()
+            set_status(line.strip()[:150])
         elif "ERROR" in line:
-            say(f"⚠️ {line.strip()[:200]}")
+            set_status(f"⚠️ {line.strip()[:180]}", force=True)
 
     if process.returncode != 0:
         if retry < max_retries:
-            say(f"🔄 yt-dlp failed, retrying… ({retry+1}/{max_retries})")
+            set_status(f"yt-dlp failed, retrying… ({retry+1}/{max_retries})", force=True)
             time.sleep(3)
             return download_one(url, title, episode_info, progress,
-                                notify, loop, is_movie, retry + 1)
-        say("❌ yt-dlp failed permanently.")
+                                notify, loop, channel, is_movie, retry + 1)
+        set_status("❌ yt-dlp failed permanently", force=True)
         return False
 
-    say(f"✅ Downloaded: {filename}")
+    set_status(f"✅ downloaded: {filename}", force=True)
 
+    # FIX: verify upscale succeeded before returning True
     if progress.upscale and progress.additional_choice != "2" \
             and progress.quality_choice in ("1", "2", "3"):
         prefix = filename.replace(".%(ext)s", "")
+        upscaled_ok = False
         for f in os.listdir(MOVIES_FOLDER):
-            if f.startswith(prefix):
+            if f.startswith(prefix) and "_4k" not in f:
                 full = os.path.join(MOVIES_FOLDER, f)
-                upscale_to_4k(full, status_cb=say, delete_source=True)
+                result = upscale_to_4k(full,
+                                       status_cb=lambda m: set_status(m, force=True),
+                                       delete_source=True)
+                upscaled_ok = bool(result)
                 break
+        if not upscaled_ok:
+            set_status("❌ upscale failed — will retry next time", force=True)
+            return False
 
+    set_status("✅ done", force=True)
     return True
 
 
@@ -564,7 +635,6 @@ def parse_selection(user_input, seasons):
 # UI — dropdowns + buttons, in-channel, restricted to the requester
 # =============================================================
 class OwnerRestrictedView(discord.ui.View):
-    """A View that only its original requester can interact with."""
     def __init__(self, owner_id, timeout=120):
         super().__init__(timeout=timeout)
         self.owner_id = owner_id
@@ -697,32 +767,51 @@ async def run_series(ctx, info, options, selection):
     title = info["title"]
     seasons = info["seasons"]
 
-    progress = DownloadProgress()
+    progress = DownloadProgress.load()
+    # If there's no matching saved progress, start fresh
+    if not progress or progress.imdb_id != imdb_id or progress.completed:
+        progress = DownloadProgress()
+
     progress.title = title
     progress.imdb_id = imdb_id
     progress.season_episode_counts = seasons
     progress.selected_episodes = selection
     progress.total_episodes = len(selection)
-    progress.start_time = time.time()
+    if not progress.start_time:
+        progress.start_time = time.time()
     progress.quality_choice = options["quality"]
     progress.additional_choice = options["additional"]
     progress.subtitles = options["subtitles"]
     progress.upscale = options["upscale"]
     progress.owner_id = ctx.author.id
     progress.channel_id = ctx.channel.id
+    # FIX: guarantee the attribute exists even for old pickles
+    if not hasattr(progress, "completed_episodes"):
+        progress.completed_episodes = []
     progress.save()
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
 
+    # Count already-completed episodes in this selection
+    completed_set = {(s, e) for s, e in progress.completed_episodes}
+    remaining = [ep for ep in selection if ep not in completed_set]
+
     await ctx.send(
-        f"▶️ Starting **{title}** — {len(selection)} episodes, "
-        f"Q{options['quality']}, upscale={'on' if options['upscale'] else 'off'}"
+        f"▶️ Starting **{title}** — {len(selection)} episodes in selection, "
+        f"{len(completed_set & set(selection))} already done, "
+        f"{len(remaining)} to go "
+        f"(Q{options['quality']}, upscale={'on' if options['upscale'] else 'off'})"
     )
 
     loop = asyncio.get_running_loop()
     all_ok = True
 
     for season, episode in selection:
+        # FIX: skip episodes already completed
+        if (season, episode) in completed_set:
+            await ctx.send(f"⏭️ S{season:02d}E{episode:02d} already downloaded, skipping")
+            continue
+
         url = construct_vidcore_url(imdb_id, True, season, episode)
         ep_info = {"season": season, "episode": episode}
 
@@ -730,11 +819,22 @@ async def run_series(ctx, info, options, selection):
             download_one,
             url, title, ep_info, progress,
             lambda m: notify(ctx.channel, m),
-            loop, False, 0
+            loop,
+            ctx.channel,
+            False, 0
         )
 
         if ok:
             progress.downloaded_episodes += 1
+            key = [season, episode]
+            if key not in progress.completed_episodes:
+                progress.completed_episodes.append(key)
+            completed_set.add((season, episode))
+            # remove from failed if it was there
+            progress.failed_episodes = [
+                f for f in progress.failed_episodes
+                if not (f["season"] == season and f["episode"] == episode)
+            ]
         else:
             progress.failed_episodes.append(ep_info)
             all_ok = False
@@ -754,7 +854,7 @@ async def run_series(ctx, info, options, selection):
         failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
         await ctx.send(f"⚠️ **{title}** — done with failures: {failed}")
 
-    # ---- The ONLY DM: job finished ----
+    # ---- The ONLY DM ----
     try:
         dm = await ctx.author.create_dm()
         if all_ok:
@@ -798,7 +898,9 @@ async def run_movie(ctx, info, options):
         download_one,
         url, title, None, progress,
         lambda m: notify(ctx.channel, m),
-        loop, True, 0
+        loop,
+        ctx.channel,
+        True, 0
     )
 
     if ok:
@@ -823,14 +925,17 @@ async def run_movie(ctx, info, options):
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
 
-    # Auto-resume any unfinished job
     p = DownloadProgress.load()
     if not p or p.completed:
         return
 
-    state = load_state()
-    channel_id = state.get("channel_id") or p.channel_id
-    owner_id = state.get("owner_id") or p.owner_id
+    # FIX: backfill in case old pickle lacks the attribute
+    if not hasattr(p, "completed_episodes"):
+        p.completed_episodes = []
+
+    state = load_state() or {}
+    channel_id = state.get("channel_id") or getattr(p, "channel_id", 0)
+    owner_id   = state.get("owner_id")   or getattr(p, "owner_id", 0)
     if not channel_id:
         print("[resume] No saved channel — skipping auto-resume.")
         return
@@ -843,9 +948,10 @@ async def on_ready():
             print(f"[resume] Channel not found: {e}")
             return
 
+    completed_count = len(p.completed_episodes)
     await channel.send(
         f"♻️ Auto-resuming **{p.title}** "
-        f"({p.downloaded_episodes}/{p.total_episodes} done)"
+        f"({completed_count}/{p.total_episodes} done, skipping completed)"
     )
 
     info = {"imdb_id": p.imdb_id, "title": p.title, "seasons": p.season_episode_counts}
@@ -928,7 +1034,6 @@ async def dl(ctx, *, query: str):
 
     await ctx.send(f"📋 **{title}** — `{imdb_id}` — {category}")
 
-    # ---- Options in-channel with dropdowns/buttons ----
     quality    = await ask_quality_in_channel(ctx)
     additional = await ask_mode_in_channel(ctx)
     subs       = await ask_yesno_in_channel(ctx, "💬 **Download subtitles?**")
@@ -1017,9 +1122,10 @@ async def status(ctx):
     if not p:
         await ctx.send("📭 No saved progress.")
         return
+    done = len(getattr(p, "completed_episodes", []))
     await ctx.send(
         f"📊 **{p.title}** — {p.percent():.1f}% "
-        f"({p.downloaded_episodes}/{p.total_episodes})"
+        f"({done}/{p.total_episodes} episodes complete)"
         + (f"\n❌ Failed: {len(p.failed_episodes)}" if p.failed_episodes else "")
     )
 
