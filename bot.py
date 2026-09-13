@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 VidCore Discord Downloader — Raspberry Pi edition
-- Discord UI with dropdowns + buttons (in-channel)
-- Only the requester can answer the prompts
-- Faster HLS downloads via --concurrent-fragments 5
-- One editable status message per episode
-- Auto-upscale to 4K (CRF 18, preset faster); deletes the non-4K original afterward
+- In-channel dropdown/button prompts (restricted to the requester)
+- One editable status message per episode; live progress via !status
+- Auto-upscale to 4K; deletes the non-4K source afterwards
 - Partial 4K files cleaned up on upscale failure
 - DMs the user ONLY when the job finishes
-- Auto-resumes unfinished series after reboot, skipping completed episodes
-- Manual override: !dlurl <m3u8_url> [title]
-- Uses Tampermonkey / Stream Detector via the X11 clipboard
+- Auto-resumes unfinished series ONCE per process (fixes ghost jobs)
+- Manual override: !dlurl <m3u8_url> [title]  (works with any site)
+- Cancel is cooperative — cancelled jobs actually stop
+- --remux-video mkv keeps files seekable
 """
 
 import subprocess
@@ -33,12 +32,12 @@ import discord
 from discord.ext import commands
 
 # =============================================================
-# CONFIG — hardcoded for the Raspberry Pi
+# CONFIG — Raspberry Pi
 # =============================================================
 DISCORD_TOKEN   = "PASTE_YOUR_BOT_TOKEN_HERE"
-ALLOWED_USER_ID = 0                 # 0 = anyone; or your numeric Discord ID
+ALLOWED_USER_ID = 0
 
-PYTHON_PATH      = sys.executable                                   # venv python
+PYTHON_PATH      = sys.executable                                  # venv python
 MOVIES_FOLDER    = "/mnt/minecraft-backups/videos"
 CHROME_PATH      = "/usr/bin/chromium"
 CHROME_USER_DATA = "/home/grap/.config/chromium"
@@ -50,6 +49,7 @@ YTDLP_MODULE  = "yt_dlp"
 # Tunables
 CONCURRENT_FRAGMENTS = 5
 STATUS_EDIT_INTERVAL = 8.0
+UPSCALE_DEFAULT_FOR_DLURL = False
 
 # =============================================================
 # Setup
@@ -69,11 +69,35 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 
 def kill_chrome():
-    """Kill any Chromium processes (Linux)."""
     try:
         subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
     except Exception:
         pass
+
+
+# =============================================================
+# Global live status
+# =============================================================
+LIVE_STATUS = {}
+LIVE_STATUS_LOCK = threading.Lock()
+
+
+def set_live_status(job_id, text):
+    with LIVE_STATUS_LOCK:
+        LIVE_STATUS[job_id] = {"text": text, "ts": time.time()}
+
+
+def clear_live_status(job_id):
+    with LIVE_STATUS_LOCK:
+        LIVE_STATUS.pop(job_id, None)
+
+
+def get_live_status(job_id):
+    with LIVE_STATUS_LOCK:
+        entry = LIVE_STATUS.get(job_id)
+        if entry:
+            return entry["text"]
+        return None
 
 
 # =============================================================
@@ -83,6 +107,7 @@ class DownloadProgress:
     def __init__(self):
         self.title = ""
         self.imdb_id = ""
+        self.kind = "series"
         self.total_episodes = 0
         self.downloaded_episodes = 0
         self.completed = False
@@ -115,8 +140,8 @@ class DownloadProgress:
             return None
 
         defaults = {
-            "title": "", "imdb_id": "", "total_episodes": 0,
-            "downloaded_episodes": 0, "completed": False,
+            "title": "", "imdb_id": "", "kind": "series",
+            "total_episodes": 0, "downloaded_episodes": 0, "completed": False,
             "failed_episodes": [], "completed_episodes": [],
             "season_episode_counts": {}, "selected_episodes": [],
             "start_time": None, "download_folder": MOVIES_FOLDER,
@@ -178,7 +203,6 @@ def classify(q_value: str, qid: str = "") -> str:
         return "movie"
     if "tv" in q:
         return "movie"
-
     return "movie"
 
 
@@ -276,7 +300,8 @@ def is_4k_source(path):
     return False
 
 
-def upscale_to_4k(input_file, status_cb=None, delete_source=True):
+def upscale_to_4k(input_file, status_cb=None, delete_source=True,
+                  cancel_event=None):
     if not os.path.exists(input_file):
         if status_cb: status_cb(f"❌ File not found: {input_file}")
         return None
@@ -314,7 +339,15 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
     threading.Thread(target=reader, daemon=True).start()
 
     last = -1
+    cancelled = False
     while process.poll() is None or not q.empty():
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            break
         try:
             line = q.get(timeout=0.2)
         except queue.Empty:
@@ -327,6 +360,19 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
                 last = secs
                 if status_cb:
                     status_cb(f"🔼 Upscaling… {h:02d}:{mn:02d}:{s:02d} encoded")
+
+    if cancelled:
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
+        if status_cb: status_cb("🛑 Upscale cancelled.")
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except Exception:
+            pass
+        return None
 
     if process.returncode != 0:
         if status_cb: status_cb("❌ Upscaling failed.")
@@ -361,178 +407,15 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
 
 
 # =============================================================
-# Per-episode download (Chrome + clipboard)
-# =============================================================
-def download_one(url, title, episode_info, progress, notify, loop, channel,
-                 is_movie=False, retry=0):
-
-    max_retries = 3
-
-    header = ""
-    if episode_info:
-        header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
-    elif is_movie:
-        header = "🎬 Movie"
-
-    status_holder = {}
-    async def _create_status():
-        status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
-    asyncio.run_coroutine_threadsafe(_create_status(), loop).result()
-    status_msg = status_holder["msg"]
-
-    last_edit = 0.0
-    def set_status(text, force=False):
-        nonlocal last_edit
-        now = time.time()
-        if not force and now - last_edit < STATUS_EDIT_INTERVAL:
-            return
-        last_edit = now
-        async def _edit():
-            try:
-                await status_msg.edit(content=f"{header}\n`{text[:180]}`")
-            except Exception as e:
-                print(f"[status edit] {e}")
-        asyncio.run_coroutine_threadsafe(_edit(), loop)
-
-    set_status("starting…", force=True)
-
-    if not check_internet():
-        set_status("waiting for internet…", force=True)
-        waited = 0
-        while waited < 300 and not check_internet():
-            time.sleep(5); waited += 5
-        if not check_internet():
-            set_status("❌ still offline, skipping", force=True)
-            return False
-
-    kill_chrome()
-    time.sleep(2)
-
-    try:
-        chrome_process = subprocess.Popen([
-            CHROME_PATH,
-            f"--user-data-dir={CHROME_USER_DATA}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=CalculateNativeWinOcclusion",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-session-crashed-bubble",
-            "--hide-crash-restore-bubble",
-            url
-        ])
-    except FileNotFoundError:
-        set_status(f"❌ Chromium not found at {CHROME_PATH}", force=True)
-        return False
-
-    m3u8_url = None
-    last_clip = ""
-    max_wait = 120
-    for attempt in range(max_wait):
-        try:
-            clip = pyperclip.paste()
-        except Exception:
-            clip = ""
-        if clip and clip != last_clip and ".m3u8" in clip and clip.startswith("http"):
-            m3u8_url = clip
-            break
-        last_clip = clip
-        set_status(f"waiting for m3u8 URL… ({attempt}s)")
-        time.sleep(1)
-
-    try:
-        chrome_process.terminate()
-        time.sleep(1)
-        kill_chrome()
-    except Exception:
-        pass
-
-    if not m3u8_url:
-        if retry < max_retries:
-            set_status(f"retrying… ({retry+1}/{max_retries})", force=True)
-            time.sleep(3)
-            return download_one(url, title, episode_info, progress,
-                                notify, loop, channel, is_movie, retry + 1)
-        if is_movie and "movie" in url:
-            imdb_id = url.split("/movie/")[-1]
-            series_url = f"https://vidcore.io/tv/{imdb_id}/1/1"
-            set_status("trying series URL…", force=True)
-            return download_one(series_url, title,
-                                {"season": 1, "episode": 1},
-                                progress, notify, loop, channel, False, 0)
-        set_status("❌ could not capture m3u8 URL", force=True)
-        return False
-
-    return _ytdlp_run(
-        m3u8_url, title, episode_info, progress,
-        status_msg=status_msg, set_status=set_status,
-        notify=notify, loop=loop, channel=channel,
-        max_retries=max_retries, retry=retry,
-        retry_fn=lambda r: download_one(url, title, episode_info, progress,
-                                        notify, loop, channel, is_movie, r)
-    )
-
-
-# =============================================================
-# Per-episode download (direct m3u8 URL — manual override)
-# =============================================================
-def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
-                      is_movie=True, retry=0):
-
-    max_retries = 3
-
-    header = "🔗 Manual URL"
-    if episode_info:
-        header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
-
-    status_holder = {}
-    async def _create_status():
-        status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
-    asyncio.run_coroutine_threadsafe(_create_status(), loop).result()
-    status_msg = status_holder["msg"]
-
-    last_edit = 0.0
-    def set_status(text, force=False):
-        nonlocal last_edit
-        now = time.time()
-        if not force and now - last_edit < STATUS_EDIT_INTERVAL:
-            return
-        last_edit = now
-        async def _edit():
-            try:
-                await status_msg.edit(content=f"{header}\n`{text[:180]}`")
-            except Exception as e:
-                print(f"[status edit] {e}")
-        asyncio.run_coroutine_threadsafe(_edit(), loop)
-
-    set_status("starting direct download…", force=True)
-
-    if not check_internet():
-        set_status("waiting for internet…", force=True)
-        waited = 0
-        while waited < 300 and not check_internet():
-            time.sleep(5); waited += 5
-        if not check_internet():
-            set_status("❌ still offline, skipping", force=True)
-            return False
-
-    return _ytdlp_run(
-        m3u8_url, title, episode_info, progress,
-        status_msg=status_msg, set_status=set_status,
-        notify=notify, loop=loop, channel=channel,
-        max_retries=max_retries, retry=retry,
-        retry_fn=lambda r: download_from_url(m3u8_url, title, episode_info, progress,
-                                             notify, loop, channel, is_movie, r)
-    )
-
-
-# =============================================================
-# Shared yt-dlp runner
+# yt-dlp runner
 # =============================================================
 def _ytdlp_run(m3u8_url, title, episode_info, progress,
                status_msg, set_status, notify, loop, channel,
+               job_id, cancel_event,
                max_retries, retry, retry_fn):
+
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
 
     quality_map = {
         "1": "bestvideo+bestaudio/best",
@@ -564,6 +447,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
     if progress.additional_choice != "2":
         yt_cmd += ["--merge-output-format", "mkv"]
+        yt_cmd += ["--remux-video", "mkv"]
 
     if progress.subtitles:
         yt_cmd += ["--write-subs", "--sub-lang", "en"]
@@ -591,22 +475,38 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         return False
 
     q = queue.Queue()
-    def reader(stream, name):
+    def reader(stream):
         for line in iter(stream.readline, ''):
-            if line: q.put((name, line.rstrip()))
+            if line: q.put(line.rstrip())
         stream.close()
-    threading.Thread(target=reader, args=(process.stdout, "out"), daemon=True).start()
-    threading.Thread(target=reader, args=(process.stderr, "err"), daemon=True).start()
+    threading.Thread(target=reader, args=(process.stdout,), daemon=True).start()
+    threading.Thread(target=reader, args=(process.stderr,), daemon=True).start()
 
     while process.poll() is None or not q.empty():
+        if cancelled():
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            break
         try:
-            _, line = q.get(timeout=0.2)
+            line = q.get(timeout=0.2)
         except queue.Empty:
             continue
         if "[download]" in line or "ETA" in line:
             set_status(line.strip()[:150])
+            set_live_status(job_id, line.strip()[:150])
         elif "ERROR" in line:
             set_status(f"⚠️ {line.strip()[:180]}", force=True)
+
+    if cancelled():
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
+        set_status("🛑 cancelled", force=True)
+        set_live_status(job_id, "🛑 cancelled")
+        return False
 
     if process.returncode != 0:
         if retry < max_retries:
@@ -627,15 +527,217 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
                 full = os.path.join(MOVIES_FOLDER, f)
                 result = upscale_to_4k(full,
                                        status_cb=lambda m: set_status(m, force=True),
-                                       delete_source=True)
+                                       delete_source=True,
+                                       cancel_event=cancel_event)
                 upscaled_ok = bool(result)
                 break
         if not upscaled_ok:
+            if cancelled():
+                set_status("🛑 cancelled during upscale", force=True)
+                return False
             set_status("❌ upscale failed — will retry next time", force=True)
             return False
 
     set_status("✅ done", force=True)
     return True
+
+
+# =============================================================
+# Chrome + clipboard downloader
+# =============================================================
+def download_one(url, title, episode_info, progress, notify, loop, channel,
+                 job_id, cancel_event,
+                 is_movie=False, retry=0):
+
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    max_retries = 3
+
+    header = ""
+    if episode_info:
+        header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
+    elif is_movie:
+        header = "🎬 Movie"
+
+    status_holder = {}
+    async def _create_status():
+        status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
+    asyncio.run_coroutine_threadsafe(_create_status(), loop).result()
+    status_msg = status_holder["msg"]
+
+    last_edit = 0.0
+    def set_status(text, force=False):
+        nonlocal last_edit
+        now = time.time()
+        if not force and now - last_edit < STATUS_EDIT_INTERVAL:
+            return
+        last_edit = now
+        async def _edit():
+            try:
+                await status_msg.edit(content=f"{header}\n`{text[:180]}`")
+            except Exception as e:
+                print(f"[status edit] {e}")
+        asyncio.run_coroutine_threadsafe(_edit(), loop)
+
+    set_status("starting…", force=True)
+
+    if cancelled():
+        set_status("🛑 cancelled before start", force=True)
+        return False
+
+    if not check_internet():
+        set_status("waiting for internet…", force=True)
+        waited = 0
+        while waited < 300 and not check_internet():
+            if cancelled():
+                set_status("🛑 cancelled while waiting", force=True)
+                return False
+            time.sleep(5); waited += 5
+        if not check_internet():
+            set_status("❌ still offline, skipping", force=True)
+            return False
+
+    kill_chrome()
+    time.sleep(2)
+
+    try:
+        chrome_process = subprocess.Popen([
+            CHROME_PATH,
+            f"--user-data-dir={CHROME_USER_DATA}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=CalculateNativeWinOcclusion",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            url
+        ])
+    except FileNotFoundError:
+        set_status(f"❌ Chromium not found at {CHROME_PATH}", force=True)
+        return False
+
+    m3u8_url = None
+    last_clip = ""
+    max_wait = 120
+    for attempt in range(max_wait):
+        if cancelled():
+            try: chrome_process.terminate()
+            except Exception: pass
+            kill_chrome()
+            set_status("🛑 cancelled while waiting for URL", force=True)
+            return False
+        try:
+            clip = pyperclip.paste()
+        except Exception:
+            clip = ""
+        if clip and clip != last_clip and ".m3u8" in clip and clip.startswith("http"):
+            m3u8_url = clip
+            break
+        last_clip = clip
+        set_status(f"waiting for m3u8 URL… ({attempt}s)")
+        time.sleep(1)
+
+    try:
+        chrome_process.terminate()
+        time.sleep(1)
+        kill_chrome()
+    except Exception:
+        pass
+
+    if not m3u8_url:
+        if retry < max_retries:
+            set_status(f"retrying… ({retry+1}/{max_retries})", force=True)
+            time.sleep(3)
+            return download_one(url, title, episode_info, progress,
+                                notify, loop, channel, job_id, cancel_event,
+                                is_movie, retry + 1)
+        if is_movie and "movie" in url:
+            imdb_id = url.split("/movie/")[-1]
+            series_url = f"https://vidcore.io/tv/{imdb_id}/1/1"
+            set_status("trying series URL…", force=True)
+            return download_one(series_url, title,
+                                {"season": 1, "episode": 1},
+                                progress, notify, loop, channel,
+                                job_id, cancel_event, False, 0)
+        set_status("❌ could not capture m3u8 URL", force=True)
+        return False
+
+    return _ytdlp_run(
+        m3u8_url, title, episode_info, progress,
+        status_msg=status_msg, set_status=set_status,
+        notify=notify, loop=loop, channel=channel,
+        job_id=job_id, cancel_event=cancel_event,
+        max_retries=max_retries, retry=retry,
+        retry_fn=lambda r: download_one(url, title, episode_info, progress,
+                                        notify, loop, channel, job_id,
+                                        cancel_event, is_movie, r)
+    )
+
+
+# =============================================================
+# Direct-URL downloader
+# =============================================================
+def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
+                      job_id, cancel_event,
+                      is_movie=True, retry=0):
+
+    max_retries = 3
+
+    header = "🔗 Manual URL"
+    if episode_info:
+        header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
+
+    status_holder = {}
+    async def _create_status():
+        status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
+    asyncio.run_coroutine_threadsafe(_create_status(), loop).result()
+    status_msg = status_holder["msg"]
+
+    last_edit = 0.0
+    def set_status(text, force=False):
+        nonlocal last_edit
+        now = time.time()
+        if not force and now - last_edit < STATUS_EDIT_INTERVAL:
+            return
+        last_edit = now
+        async def _edit():
+            try:
+                await status_msg.edit(content=f"{header}\n`{text[:180]}`")
+            except Exception as e:
+                print(f"[status edit] {e}")
+        asyncio.run_coroutine_threadsafe(_edit(), loop)
+
+    set_status("starting direct download…", force=True)
+
+    if cancel_event is not None and cancel_event.is_set():
+        set_status("🛑 cancelled before start", force=True)
+        return False
+
+    if not check_internet():
+        set_status("waiting for internet…", force=True)
+        waited = 0
+        while waited < 300 and not check_internet():
+            if cancel_event is not None and cancel_event.is_set():
+                set_status("🛑 cancelled while waiting", force=True)
+                return False
+            time.sleep(5); waited += 5
+        if not check_internet():
+            set_status("❌ still offline, skipping", force=True)
+            return False
+
+    return _ytdlp_run(
+        m3u8_url, title, episode_info, progress,
+        status_msg=status_msg, set_status=set_status,
+        notify=notify, loop=loop, channel=channel,
+        job_id=job_id, cancel_event=cancel_event,
+        max_retries=max_retries, retry=retry,
+        retry_fn=lambda r: download_from_url(m3u8_url, title, episode_info,
+                                             progress, notify, loop, channel,
+                                             job_id, cancel_event, is_movie, r)
+    )
 
 
 # =============================================================
@@ -834,7 +936,7 @@ async def notify(channel, msg):
         print(f"[notify] {e}")
 
 
-async def run_series(ctx, info, options, selection):
+async def run_series(ctx, info, options, selection, job_id, cancel_event):
     imdb_id = info["imdb_id"]
     title = info["title"]
     seasons = info["seasons"]
@@ -845,6 +947,7 @@ async def run_series(ctx, info, options, selection):
 
     progress.title = title
     progress.imdb_id = imdb_id
+    progress.kind = "series"
     progress.season_episode_counts = seasons
     progress.selected_episodes = selection
     progress.total_episodes = len(selection)
@@ -876,6 +979,10 @@ async def run_series(ctx, info, options, selection):
     all_ok = True
 
     for season, episode in selection:
+        if cancel_event.is_set():
+            await ctx.send("🛑 Series cancelled.")
+            break
+
         if (season, episode) in completed_set:
             await ctx.send(f"⏭️ S{season:02d}E{episode:02d} already downloaded, skipping")
             continue
@@ -889,6 +996,8 @@ async def run_series(ctx, info, options, selection):
             lambda m: notify(ctx.channel, m),
             loop,
             ctx.channel,
+            job_id,
+            cancel_event,
             False, 0
         )
 
@@ -903,6 +1012,8 @@ async def run_series(ctx, info, options, selection):
                 if not (f["season"] == season and f["episode"] == episode)
             ]
         else:
+            if cancel_event.is_set():
+                break
             progress.failed_episodes.append(ep_info)
             all_ok = False
         progress.save()
@@ -912,14 +1023,21 @@ async def run_series(ctx, info, options, selection):
             f"({progress.downloaded_episodes}/{progress.total_episodes})"
         )
 
-    progress.completed = all_ok
+    if not cancel_event.is_set():
+        progress.completed = all_ok
     progress.save()
+
+    if cancel_event.is_set():
+        return
 
     if all_ok:
         await ctx.send(f"🎉 **{title}** — all selected episodes downloaded!")
     else:
         failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
-        await ctx.send(f"⚠️ **{title}** — done with failures: {failed}")
+        await ctx.send(
+            f"⚠️ **{title}** — done with failures: {failed}\n"
+            f"💡 Use `!dlurl <m3u8_url> <title>` to supply a manual source for a failed episode."
+        )
 
     try:
         dm = await ctx.author.create_dm()
@@ -940,13 +1058,14 @@ async def run_series(ctx, info, options, selection):
         print(f"[dm] {e}")
 
 
-async def run_movie(ctx, info, options):
+async def run_movie(ctx, info, options, job_id, cancel_event):
     imdb_id = info["imdb_id"]
     title = info["title"]
 
     progress = DownloadProgress()
     progress.title = title
     progress.imdb_id = imdb_id
+    progress.kind = "movie"
     progress.quality_choice = options["quality"]
     progress.additional_choice = options["additional"]
     progress.subtitles = options["subtitles"]
@@ -969,8 +1088,13 @@ async def run_movie(ctx, info, options):
         lambda m: notify(ctx.channel, m),
         loop,
         ctx.channel,
+        job_id,
+        cancel_event,
         True, 0
     )
+
+    if cancel_event.is_set():
+        return
 
     if ok:
         progress.downloaded_episodes = 1
@@ -992,13 +1116,13 @@ async def run_movie(ctx, info, options):
         print(f"[dm] {e}")
 
 
-async def run_movie_with_url(ctx, info, options, url):
-    """Download directly from a provided m3u8 URL — skips Chrome/clipboard."""
+async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
     title = info["title"]
 
     progress = DownloadProgress()
     progress.title = title
     progress.imdb_id = "manual"
+    progress.kind = "movie_url"
     progress.quality_choice = options["quality"]
     progress.additional_choice = options["additional"]
     progress.subtitles = options["subtitles"]
@@ -1020,8 +1144,13 @@ async def run_movie_with_url(ctx, info, options, url):
         lambda m: notify(ctx.channel, m),
         loop,
         ctx.channel,
+        job_id,
+        cancel_event,
         True, 0
     )
+
+    if cancel_event.is_set():
+        return
 
     if ok:
         progress.downloaded_episodes = 1
@@ -1080,6 +1209,7 @@ class Job:
         self.task = None
         self.done_event = asyncio.Event()
         self.manual_url = None
+        self.cancel_event = threading.Event()
 
     def describe(self):
         try:
@@ -1112,6 +1242,7 @@ job_queue = deque()
 job_id_counter = itertools.count(1)
 job_cond = asyncio.Condition()
 queue_worker_task = None
+AUTO_RESUMED_ONCE = False
 
 
 def ensure_queue_worker():
@@ -1156,11 +1287,14 @@ def queue_status_text():
 async def run_job(job):
     try:
         if job.kind == "series":
-            await run_series(job.ctx, job.info, job.options, job.selection)
+            await run_series(job.ctx, job.info, job.options, job.selection,
+                             job.job_id, job.cancel_event)
         elif job.kind == "movie":
-            await run_movie(job.ctx, job.info, job.options)
+            await run_movie(job.ctx, job.info, job.options,
+                            job.job_id, job.cancel_event)
         elif job.kind == "movie_url":
-            await run_movie_with_url(job.ctx, job.info, job.options, job.manual_url)
+            await run_movie_with_url(job.ctx, job.info, job.options,
+                                     job.manual_url, job.job_id, job.cancel_event)
         job.status = "done"
     except asyncio.CancelledError:
         job.status = "cancelled"
@@ -1175,6 +1309,7 @@ async def run_job(job):
         except Exception:
             pass
     finally:
+        clear_live_status(job.job_id)
         job.done_event.set()
         async with job_cond:
             prune_queue()
@@ -1202,8 +1337,14 @@ async def run_queue_worker():
 # =============================================================
 @bot.event
 async def on_ready():
+    global AUTO_RESUMED_ONCE
+
     print(f"✅ Logged in as {bot.user}")
     ensure_queue_worker()
+
+    if AUTO_RESUMED_ONCE:
+        return
+    AUTO_RESUMED_ONCE = True
 
     p = DownloadProgress.load()
     if not p or p.completed:
@@ -1212,15 +1353,23 @@ async def on_ready():
     if not hasattr(p, "completed_episodes"):
         p.completed_episodes = []
 
+    if p.imdb_id == "manual" or p.kind == "movie_url":
+        print("[resume] Skipping manual download resume.")
+        return
+
+    if p.kind == "movie" and not p.selected_episodes:
+        print("[resume] Skipping movie resume (no selection).")
+        return
+
+    if p.total_episodes and p.downloaded_episodes >= p.total_episodes:
+        print("[resume] Progress already complete.")
+        return
+
     state = load_state() or {}
     channel_id = state.get("channel_id") or getattr(p, "channel_id", 0)
     owner_id   = state.get("owner_id")   or getattr(p, "owner_id", 0)
     if not channel_id:
         print("[resume] No saved channel — skipping auto-resume.")
-        return
-
-    if p.imdb_id == "manual":
-        print("[resume] Skipping manual download resume.")
         return
 
     channel = bot.get_channel(channel_id)
@@ -1404,7 +1553,7 @@ async def dlurl(ctx, url: str, *, title: str = None):
     quality    = await ask_quality_in_channel(ctx)
     additional = await ask_mode_in_channel(ctx)
     subs       = await ask_yesno_in_channel(ctx, "💬 **Download subtitles?**")
-    upscale    = await ask_yesno_in_channel(ctx, "🔼 **Upscale to 4K if not already 4K?**")
+    upscale    = await ask_yesno_in_channel(ctx, "🔼 **Upscale to 4K?**")
 
     options = {
         "quality": quality,
@@ -1425,6 +1574,19 @@ async def dlurl(ctx, url: str, *, title: str = None):
 async def status(ctx):
     if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
         return
+
+    running_jobs = [j for j in job_queue if j.status == "running"]
+    if running_jobs:
+        lines = []
+        for j in running_jobs:
+            live = get_live_status(j.job_id)
+            if live:
+                lines.append(f"▶️ **#{j.job_id}** {j.describe()}\n`{live}`")
+            else:
+                lines.append(f"▶️ **#{j.job_id}** {j.describe()}\n_(starting…)_")
+        await ctx.send("**Live status:**\n" + "\n".join(lines))
+        return
+
     p = DownloadProgress.load()
     if not p:
         await ctx.send("📭 No saved progress.")
@@ -1476,6 +1638,7 @@ async def cancel(ctx, job_id: int = None):
             job_queue.remove(job)
             await ctx.send(f"✅ Removed job #{job.job_id} from the queue.")
         else:
+            job.cancel_event.set()
             if job.task:
                 job.task.cancel()
             await ctx.send(f"🛑 Cancelling job #{job.job_id}…")
@@ -1484,6 +1647,7 @@ async def cancel(ctx, job_id: int = None):
     job = next((j for j in job_queue
                 if j.owner_id == ctx.author.id and j.status == "running"), None)
     if job:
+        job.cancel_event.set()
         if job.task:
             job.task.cancel()
         await ctx.send(f"🛑 Cancelling job #{job.job_id}…")
