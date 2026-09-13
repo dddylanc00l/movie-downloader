@@ -4,12 +4,11 @@ VidCore Discord Downloader — Raspberry Pi edition
 - In-channel dropdown/button prompts (restricted to the requester)
 - One editable status message per episode; live progress via !status
 - Auto-upscale to 4K; deletes the non-4K source afterwards
-- Partial 4K files cleaned up on upscale failure
+- Cancel deletes partial downloads completely
 - DMs the user ONLY when the job finishes
-- Auto-resumes unfinished series ONCE per process (fixes ghost jobs)
-- Manual override: !dlurl <m3u8_url> [title]  (works with any site)
-- Cancel is cooperative — cancelled jobs actually stop
-- --remux-video mkv keeps files seekable
+- Auto-resumes interrupted downloads ONCE per process
+- Manual override: !dlurl <m3u8_url> [title]
+- MP4 output (seekable) for maximum player compatibility
 """
 
 import subprocess
@@ -22,6 +21,7 @@ import json
 import pickle
 import asyncio
 import itertools
+import shutil
 import requests
 import threading
 import queue
@@ -37,24 +37,27 @@ from discord.ext import commands
 DISCORD_TOKEN   = "PASTE_YOUR_BOT_TOKEN_HERE"
 ALLOWED_USER_ID = 0
 
-PYTHON_PATH      = sys.executable                                  # venv python
+PYTHON_PATH      = sys.executable
 MOVIES_FOLDER    = "/mnt/minecraft-backups/videos"
 CHROME_PATH      = "/usr/bin/chromium"
 CHROME_USER_DATA = "/home/grap/.config/chromium"
 
-PROGRESS_FILE = "download_progress.pkl"
-STATE_FILE    = "bot_state.json"
-YTDLP_MODULE  = "yt_dlp"
+PROGRESS_FILE      = "download_progress.pkl"
+STATE_FILE         = "bot_state.json"
+MOVIE_STATE_FILE   = "movie_downloads.pkl"   # tracks in-flight movie downloads
+TEMP_FOLDER        = "tmp"                     # yt-dlp temp dir for fragments
+
+YTDLP_MODULE = "yt_dlp"
 
 # Tunables
 CONCURRENT_FRAGMENTS = 5
 STATUS_EDIT_INTERVAL = 8.0
-UPSCALE_DEFAULT_FOR_DLURL = False
 
 # =============================================================
 # Setup
 # =============================================================
 os.makedirs(MOVIES_FOLDER, exist_ok=True)
+os.makedirs(os.path.join(MOVIES_FOLDER, TEMP_FOLDER), exist_ok=True)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 '
@@ -73,6 +76,42 @@ def kill_chrome():
         subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
     except Exception:
         pass
+
+
+def safe_delete(path):
+    """Delete a file or folder if it exists, ignoring errors."""
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception as e:
+        print(f"[safe_delete] {path}: {e}")
+
+
+def cleanup_download_artifacts(output_prefix):
+    """
+    Remove every file matching a download prefix (partials, parts,
+    yt-dlp metadata, and the temp fragment directory).
+    """
+    try:
+        for f in os.listdir(MOVIES_FOLDER):
+            full = os.path.join(MOVIES_FOLDER, f)
+            # Skip the temp dir itself
+            if os.path.isdir(full):
+                continue
+            # Match anything starting with the prefix, including
+            # .part, .ytdl, .f*.mp4 fragment files, etc.
+            if f.startswith(output_prefix):
+                safe_delete(full)
+        # Also nuke any yt-dlp fragment dir for this download
+        for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
+            if entry.startswith(output_prefix):
+                safe_delete(os.path.join(MOVIES_FOLDER, TEMP_FOLDER, entry))
+    except Exception as e:
+        print(f"[cleanup] {e}")
 
 
 # =============================================================
@@ -95,9 +134,55 @@ def clear_live_status(job_id):
 def get_live_status(job_id):
     with LIVE_STATUS_LOCK:
         entry = LIVE_STATUS.get(job_id)
-        if entry:
-            return entry["text"]
-        return None
+        return entry["text"] if entry else None
+
+
+# =============================================================
+# Movie downloads state
+# =============================================================
+class MovieDownloadsState:
+    """
+    Persisted record of in-flight movie downloads so we can resume
+    after a reboot / restart. Keyed by output prefix.
+    """
+    def __init__(self):
+        # {prefix: {"url": ..., "title": ..., "quality": ..., "additional": ...}}
+        self.entries = {}
+
+    @staticmethod
+    def _path():
+        return os.path.join(MOVIES_FOLDER, MOVIE_STATE_FILE)
+
+    @staticmethod
+    def load():
+        s = MovieDownloadsState()
+        try:
+            with open(MovieDownloadsState._path(), 'rb') as f:
+                s.entries = pickle.load(f)
+        except Exception:
+            s.entries = {}
+        return s
+
+    def save(self):
+        try:
+            with open(self._path(), 'wb') as f:
+                pickle.dump(self.entries, f)
+        except Exception as e:
+            print(f"[movie state save] {e}")
+
+    def add(self, prefix, url, title, quality, additional):
+        self.entries[prefix] = {
+            "url": url, "title": title,
+            "quality": quality, "additional": additional,
+        }
+        self.save()
+
+    def remove(self, prefix):
+        self.entries.pop(prefix, None)
+        self.save()
+
+    def get(self, prefix):
+        return self.entries.get(prefix)
 
 
 # =============================================================
@@ -367,29 +452,17 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
         except Exception:
             process.kill()
         if status_cb: status_cb("🛑 Upscale cancelled.")
-        try:
-            if os.path.exists(output_file):
-                os.remove(output_file)
-        except Exception:
-            pass
+        safe_delete(output_file)
         return None
 
     if process.returncode != 0:
         if status_cb: status_cb("❌ Upscaling failed.")
-        try:
-            if os.path.exists(output_file):
-                os.remove(output_file)
-        except Exception:
-            pass
+        safe_delete(output_file)
         return None
 
     if not os.path.exists(output_file) or os.path.getsize(output_file) < 1024 * 1024:
         if status_cb: status_cb("❌ Upscaled file missing or too small.")
-        try:
-            if os.path.exists(output_file):
-                os.remove(output_file)
-        except Exception:
-            pass
+        safe_delete(output_file)
         return None
 
     if status_cb: status_cb(f"✅ Upscaled: {os.path.basename(output_file)}")
@@ -427,6 +500,21 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     }
     fmt = quality_map.get(progress.quality_choice, "bestvideo+bestaudio/best")
 
+    # Build output base name (no extension — yt-dlp fills that in)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if title:
+        safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
+        if episode_info:
+            base_name = (f"{safe}_S{episode_info['season']:02d}"
+                         f"E{episode_info['episode']:02d}_Q{progress.quality_choice}")
+        else:
+            base_name = f"{safe}_{ts}_Q{progress.quality_choice}"
+    else:
+        base_name = f"video_{ts}"
+
+    out_path = os.path.join(MOVIES_FOLDER, base_name + ".%(ext)s")
+    temp_dir = os.path.join(MOVIES_FOLDER, TEMP_FOLDER)
+
     yt_cmd = [
         PYTHON_PATH, "-m", YTDLP_MODULE,
         "--referer", "https://vidcore.io/",
@@ -434,7 +522,8 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         "--fragment-retries", "10",
         "--retry-sleep", "2",
         "--http-chunk-size", "10M",
-        "--no-part",
+        "--continue",                              # resume from .part if present
+        "--paths", f"temp:{temp_dir}",             # fragments go here
         m3u8_url,
     ]
 
@@ -446,24 +535,13 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         yt_cmd += ["-f", fmt]
 
     if progress.additional_choice != "2":
-        yt_cmd += ["--merge-output-format", "mkv"]
-        yt_cmd += ["--remux-video", "mkv"]
+        # Force MP4 container — seekable and universally playable
+        yt_cmd += ["--merge-output-format", "mp4"]
+        yt_cmd += ["--remux-video", "mp4"]
 
     if progress.subtitles:
         yt_cmd += ["--write-subs", "--sub-lang", "en"]
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if title:
-        safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
-        if episode_info:
-            filename = (f"{safe}_S{episode_info['season']:02d}"
-                        f"E{episode_info['episode']:02d}_Q{progress.quality_choice}.%(ext)s")
-        else:
-            filename = f"{safe}_{ts}_Q{progress.quality_choice}.%(ext)s"
-    else:
-        filename = f"video_{ts}.%(ext)s"
-
-    out_path = os.path.join(MOVIES_FOLDER, filename)
     yt_cmd += ["-o", out_path, "--progress", "--newline"]
 
     try:
@@ -499,15 +577,18 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         elif "ERROR" in line:
             set_status(f"⚠️ {line.strip()[:180]}", force=True)
 
+    # -- Cancelled: delete everything --
     if cancelled():
         try:
             process.wait(timeout=5)
         except Exception:
             process.kill()
-        set_status("🛑 cancelled", force=True)
+        cleanup_download_artifacts(base_name)
+        set_status("🛑 cancelled — files deleted", force=True)
         set_live_status(job_id, "🛑 cancelled")
         return False
 
+    # -- Failed: retry --
     if process.returncode != 0:
         if retry < max_retries:
             set_status(f"yt-dlp failed, retrying… ({retry+1}/{max_retries})", force=True)
@@ -516,24 +597,37 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         set_status("❌ yt-dlp failed permanently", force=True)
         return False
 
-    set_status(f"✅ downloaded: {filename}", force=True)
+    # -- Success --
+    set_status(f"✅ downloaded: {base_name}", force=True)
 
+    # Remove from persisted movie state
+    MovieDownloadsState.load().remove(base_name)
+
+    # -- Upscale --
     if progress.upscale and progress.additional_choice != "2" \
             and progress.quality_choice in ("1", "2", "3"):
-        prefix = filename.replace(".%(ext)s", "")
-        upscaled_ok = False
+        # Find whatever file yt-dlp actually created
+        actual = None
         for f in os.listdir(MOVIES_FOLDER):
-            if f.startswith(prefix) and "_4k" not in f:
-                full = os.path.join(MOVIES_FOLDER, f)
-                result = upscale_to_4k(full,
-                                       status_cb=lambda m: set_status(m, force=True),
-                                       delete_source=True,
-                                       cancel_event=cancel_event)
-                upscaled_ok = bool(result)
+            if f.startswith(base_name) and not f.endswith(".part") \
+                    and "_4k" not in f and os.path.isfile(
+                        os.path.join(MOVIES_FOLDER, f)):
+                actual = os.path.join(MOVIES_FOLDER, f)
                 break
-        if not upscaled_ok:
+
+        if not actual:
+            set_status("❌ could not find downloaded file for upscale", force=True)
+            return False
+
+        result = upscale_to_4k(actual,
+                               status_cb=lambda m: set_status(m, force=True),
+                               delete_source=True,
+                               cancel_event=cancel_event)
+        if not result:
             if cancelled():
                 set_status("🛑 cancelled during upscale", force=True)
+                # Delete the non-4K source too since user cancelled
+                safe_delete(actual)
                 return False
             set_status("❌ upscale failed — will retry next time", force=True)
             return False
@@ -678,7 +772,7 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
 
 
 # =============================================================
-# Direct-URL downloader
+# Direct-URL downloader (also persists URL for resume)
 # =============================================================
 def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
                       job_id, cancel_event,
@@ -727,6 +821,15 @@ def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, cha
         if not check_internet():
             set_status("❌ still offline, skipping", force=True)
             return False
+
+    # Persist the manual URL so we can resume if interrupted
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "manual").replace(' ', '_')
+    base_name = f"{safe}_{ts}_Q{progress.quality_choice}"
+    MovieDownloadsState.load().add(
+        base_name, m3u8_url, title or "manual",
+        progress.quality_choice, progress.additional_choice
+    )
 
     return _ytdlp_run(
         m3u8_url, title, episode_info, progress,
@@ -1346,6 +1449,46 @@ async def on_ready():
         return
     AUTO_RESUMED_ONCE = True
 
+    # --- Resume in-flight manual downloads ---
+    mstate = MovieDownloadsState.load()
+    if mstate.entries:
+        state = load_state() or {}
+        channel_id = state.get("channel_id")
+        channel = None
+        if channel_id:
+            channel = bot.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                except Exception:
+                    pass
+
+        if channel:
+            for prefix, entry in list(mstate.entries.items()):
+                await channel.send(
+                    f"♻️ Resuming manual download **{entry['title']}** (prefix `{prefix}`)"
+                )
+                # Rebuild a minimal progress object
+                prog = DownloadProgress()
+                prog.title = entry["title"]
+                prog.imdb_id = "manual"
+                prog.kind = "movie_url"
+                prog.quality_choice = entry.get("quality", "1")
+                prog.additional_choice = entry.get("additional", "3")
+                prog.owner_id = state.get("owner_id", 0)
+                prog.channel_id = channel_id
+
+                info = {"imdb_id": "manual", "title": entry["title"], "type": "movie"}
+                opts = {"quality": prog.quality_choice,
+                        "additional": prog.additional_choice,
+                        "subtitles": False, "upscale": False}
+
+                job = Job("movie_url", _JobCtx(channel, _StubUser(prog.owner_id)),
+                          info, opts)
+                job.manual_url = entry["url"]
+                enqueue(job)
+
+    # --- Resume series ---
     p = DownloadProgress.load()
     if not p or p.completed:
         return
@@ -1354,15 +1497,12 @@ async def on_ready():
         p.completed_episodes = []
 
     if p.imdb_id == "manual" or p.kind == "movie_url":
-        print("[resume] Skipping manual download resume.")
         return
 
     if p.kind == "movie" and not p.selected_episodes:
-        print("[resume] Skipping movie resume (no selection).")
         return
 
     if p.total_episodes and p.downloaded_episodes >= p.total_episodes:
-        print("[resume] Progress already complete.")
         return
 
     state = load_state() or {}
@@ -1534,7 +1674,6 @@ async def dl(ctx, *, query: str):
 
 @bot.command(name="dlurl")
 async def dlurl(ctx, url: str, *, title: str = None):
-    """Manual override: !dlurl <m3u8_url> [optional title]"""
     if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
         await ctx.send("⛔ Not authorized.")
         return
