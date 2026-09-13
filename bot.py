@@ -9,40 +9,43 @@ VidCore Discord Downloader — Raspberry Pi edition
 - Partial 4K files cleaned up on upscale failure
 - DMs the user ONLY when the job finishes
 - Auto-resumes unfinished series after reboot, skipping completed episodes
+- Manual override: !dlurl <m3u8_url> [title]
 - Uses Tampermonkey / Stream Detector via the X11 clipboard
 """
 
 import subprocess
 import time
+import pyperclip
 import os
 import sys
 import re
 import json
 import pickle
 import asyncio
+import itertools
 import requests
 import threading
 import queue
+from collections import deque
 from datetime import datetime
 
 import discord
 from discord.ext import commands
 
 # =============================================================
-# CONFIG
+# CONFIG — hardcoded for the Raspberry Pi
 # =============================================================
 DISCORD_TOKEN   = "PASTE_YOUR_BOT_TOKEN_HERE"
 ALLOWED_USER_ID = 0                 # 0 = anyone; or your numeric Discord ID
 
-MOVIES_FOLDER   = "/mnt/minecraft-backups/videos"
-PROGRESS_FILE   = "download_progress.pkl"
-STATE_FILE      = "bot_state.json"
-
-PYTHON_PATH     = sys.executable
-YTDLP_MODULE    = "yt_dlp"
-
+PYTHON_PATH      = sys.executable                                   # venv python
+MOVIES_FOLDER    = "/mnt/minecraft-backups/videos"
 CHROME_PATH      = "/usr/bin/chromium"
 CHROME_USER_DATA = "/home/grap/.config/chromium"
+
+PROGRESS_FILE = "download_progress.pkl"
+STATE_FILE    = "bot_state.json"
+YTDLP_MODULE  = "yt_dlp"
 
 # Tunables
 CONCURRENT_FRAGMENTS = 5
@@ -64,7 +67,13 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-active_jobs = {}
+
+def kill_chrome():
+    """Kill any Chromium processes (Linux)."""
+    try:
+        subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
+    except Exception:
+        pass
 
 
 # =============================================================
@@ -78,7 +87,7 @@ class DownloadProgress:
         self.downloaded_episodes = 0
         self.completed = False
         self.failed_episodes = []
-        self.completed_episodes = []       # FIX: list of [season, episode]
+        self.completed_episodes = []
         self.season_episode_counts = {}
         self.selected_episodes = []
         self.start_time = None
@@ -106,23 +115,14 @@ class DownloadProgress:
             return None
 
         defaults = {
-            "title": "",
-            "imdb_id": "",
-            "total_episodes": 0,
-            "downloaded_episodes": 0,
-            "completed": False,
-            "failed_episodes": [],
-            "completed_episodes": [],       # FIX: backfill for old pickles
-            "season_episode_counts": {},
-            "selected_episodes": [],
-            "start_time": None,
-            "download_folder": MOVIES_FOLDER,
-            "owner_id": 0,
-            "channel_id": 0,
-            "quality_choice": "1",
-            "additional_choice": "3",
-            "subtitles": False,
-            "upscale": False,
+            "title": "", "imdb_id": "", "total_episodes": 0,
+            "downloaded_episodes": 0, "completed": False,
+            "failed_episodes": [], "completed_episodes": [],
+            "season_episode_counts": {}, "selected_episodes": [],
+            "start_time": None, "download_folder": MOVIES_FOLDER,
+            "owner_id": 0, "channel_id": 0,
+            "quality_choice": "1", "additional_choice": "3",
+            "subtitles": False, "upscale": False,
         }
         for name, default in defaults.items():
             if not hasattr(obj, name):
@@ -162,15 +162,24 @@ def load_state():
 # =============================================================
 # IMDb helpers
 # =============================================================
-def classify(q):
-    q = (q or "").strip().lower()
+def classify(q_value: str, qid: str = "") -> str:
+    qid = (qid or "").strip()
+    if qid:
+        low = qid.lower()
+        if "series" in low:
+            return "series"
+        if low in ("movie", "tv movie", "video", "short", "tv special", "tvshort"):
+            return "movie"
+
+    q = (q_value or "").strip().lower()
     if "series" in q:
         return "series"
     if q in ("tv movie", "movie", "video", "short"):
         return "movie"
     if "tv" in q:
         return "movie"
-    return "unknown"
+
+    return "movie"
 
 
 def search_imdb(query, limit=5):
@@ -268,10 +277,6 @@ def is_4k_source(path):
 
 
 def upscale_to_4k(input_file, status_cb=None, delete_source=True):
-    """
-    Upscale to 4K. Deletes the non-4K source on success (if delete_source).
-    Returns the path of the 4K file, or None on failure.
-    """
     if not os.path.exists(input_file):
         if status_cb: status_cb(f"❌ File not found: {input_file}")
         return None
@@ -325,7 +330,6 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
 
     if process.returncode != 0:
         if status_cb: status_cb("❌ Upscaling failed.")
-        # FIX: remove partial _4k file so resume doesn't get confused
         try:
             if os.path.exists(output_file):
                 os.remove(output_file)
@@ -357,13 +361,10 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True):
 
 
 # =============================================================
-# Per-episode download
+# Per-episode download (Chrome + clipboard)
 # =============================================================
 def download_one(url, title, episode_info, progress, notify, loop, channel,
                  is_movie=False, retry=0):
-
-    def say(msg):
-        asyncio.run_coroutine_threadsafe(notify(msg), loop)
 
     max_retries = 3
 
@@ -373,7 +374,6 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
     elif is_movie:
         header = "🎬 Movie"
 
-    # ---- One editable status message per episode ----
     status_holder = {}
     async def _create_status():
         status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
@@ -405,29 +405,32 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
             set_status("❌ still offline, skipping", force=True)
             return False
 
-    subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
+    kill_chrome()
     time.sleep(2)
 
-    chrome_process = subprocess.Popen([
-        CHROME_PATH,
-        f"--user-data-dir={CHROME_USER_DATA}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-session-crashed-bubble",
-        "--hide-crash-restore-bubble",
-        url
-    ])
+    try:
+        chrome_process = subprocess.Popen([
+            CHROME_PATH,
+            f"--user-data-dir={CHROME_USER_DATA}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=CalculateNativeWinOcclusion",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
+            url
+        ])
+    except FileNotFoundError:
+        set_status(f"❌ Chromium not found at {CHROME_PATH}", force=True)
+        return False
 
     m3u8_url = None
     last_clip = ""
     max_wait = 120
     for attempt in range(max_wait):
         try:
-            import pyperclip
             clip = pyperclip.paste()
         except Exception:
             clip = ""
@@ -441,7 +444,7 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
     try:
         chrome_process.terminate()
         time.sleep(1)
-        subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
+        kill_chrome()
     except Exception:
         pass
 
@@ -461,7 +464,75 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
         set_status("❌ could not capture m3u8 URL", force=True)
         return False
 
-    set_status("m3u8 captured, downloading…", force=True)
+    return _ytdlp_run(
+        m3u8_url, title, episode_info, progress,
+        status_msg=status_msg, set_status=set_status,
+        notify=notify, loop=loop, channel=channel,
+        max_retries=max_retries, retry=retry,
+        retry_fn=lambda r: download_one(url, title, episode_info, progress,
+                                        notify, loop, channel, is_movie, r)
+    )
+
+
+# =============================================================
+# Per-episode download (direct m3u8 URL — manual override)
+# =============================================================
+def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
+                      is_movie=True, retry=0):
+
+    max_retries = 3
+
+    header = "🔗 Manual URL"
+    if episode_info:
+        header = f"📺 S{episode_info['season']:02d}E{episode_info['episode']:02d}"
+
+    status_holder = {}
+    async def _create_status():
+        status_holder["msg"] = await channel.send(f"{header}\n_initializing…_")
+    asyncio.run_coroutine_threadsafe(_create_status(), loop).result()
+    status_msg = status_holder["msg"]
+
+    last_edit = 0.0
+    def set_status(text, force=False):
+        nonlocal last_edit
+        now = time.time()
+        if not force and now - last_edit < STATUS_EDIT_INTERVAL:
+            return
+        last_edit = now
+        async def _edit():
+            try:
+                await status_msg.edit(content=f"{header}\n`{text[:180]}`")
+            except Exception as e:
+                print(f"[status edit] {e}")
+        asyncio.run_coroutine_threadsafe(_edit(), loop)
+
+    set_status("starting direct download…", force=True)
+
+    if not check_internet():
+        set_status("waiting for internet…", force=True)
+        waited = 0
+        while waited < 300 and not check_internet():
+            time.sleep(5); waited += 5
+        if not check_internet():
+            set_status("❌ still offline, skipping", force=True)
+            return False
+
+    return _ytdlp_run(
+        m3u8_url, title, episode_info, progress,
+        status_msg=status_msg, set_status=set_status,
+        notify=notify, loop=loop, channel=channel,
+        max_retries=max_retries, retry=retry,
+        retry_fn=lambda r: download_from_url(m3u8_url, title, episode_info, progress,
+                                             notify, loop, channel, is_movie, r)
+    )
+
+
+# =============================================================
+# Shared yt-dlp runner
+# =============================================================
+def _ytdlp_run(m3u8_url, title, episode_info, progress,
+               status_msg, set_status, notify, loop, channel,
+               max_retries, retry, retry_fn):
 
     quality_map = {
         "1": "bestvideo+bestaudio/best",
@@ -476,7 +547,6 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
     yt_cmd = [
         PYTHON_PATH, "-m", YTDLP_MODULE,
         "--referer", "https://vidcore.io/",
-        "--cookies-from-browser", "chromium",
         "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
         "--fragment-retries", "10",
         "--retry-sleep", "2",
@@ -542,20 +612,17 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
         if retry < max_retries:
             set_status(f"yt-dlp failed, retrying… ({retry+1}/{max_retries})", force=True)
             time.sleep(3)
-            return download_one(url, title, episode_info, progress,
-                                notify, loop, channel, is_movie, retry + 1)
+            return retry_fn(retry + 1)
         set_status("❌ yt-dlp failed permanently", force=True)
         return False
 
     set_status(f"✅ downloaded: {filename}", force=True)
 
-    # FIX: only mark episode complete if upscale also succeeded
     if progress.upscale and progress.additional_choice != "2" \
             and progress.quality_choice in ("1", "2", "3"):
         prefix = filename.replace(".%(ext)s", "")
         upscaled_ok = False
         for f in os.listdir(MOVIES_FOLDER):
-            # only pick the non-4K source file
             if f.startswith(prefix) and "_4k" not in f:
                 full = os.path.join(MOVIES_FOLDER, f)
                 result = upscale_to_4k(full,
@@ -637,7 +704,7 @@ def parse_selection(user_input, seasons):
 
 
 # =============================================================
-# UI — dropdowns + buttons, in-channel, restricted to the requester
+# UI
 # =============================================================
 class OwnerRestrictedView(discord.ui.View):
     def __init__(self, owner_id, timeout=120):
@@ -772,7 +839,6 @@ async def run_series(ctx, info, options, selection):
     title = info["title"]
     seasons = info["seasons"]
 
-    # FIX: reuse existing progress if it matches this series
     progress = DownloadProgress.load()
     if not progress or progress.imdb_id != imdb_id or progress.completed:
         progress = DownloadProgress()
@@ -790,7 +856,6 @@ async def run_series(ctx, info, options, selection):
     progress.upscale = options["upscale"]
     progress.owner_id = ctx.author.id
     progress.channel_id = ctx.channel.id
-    # FIX: guarantee the attribute exists even for old pickles
     if not hasattr(progress, "completed_episodes"):
         progress.completed_episodes = []
     progress.save()
@@ -811,7 +876,6 @@ async def run_series(ctx, info, options, selection):
     all_ok = True
 
     for season, episode in selection:
-        # FIX: skip episodes already completed
         if (season, episode) in completed_set:
             await ctx.send(f"⏭️ S{season:02d}E{episode:02d} already downloaded, skipping")
             continue
@@ -834,7 +898,6 @@ async def run_series(ctx, info, options, selection):
             if key not in progress.completed_episodes:
                 progress.completed_episodes.append(key)
             completed_set.add((season, episode))
-            # remove from failed if it was there
             progress.failed_episodes = [
                 f for f in progress.failed_episodes
                 if not (f["season"] == season and f["episode"] == episode)
@@ -858,7 +921,6 @@ async def run_series(ctx, info, options, selection):
         failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
         await ctx.send(f"⚠️ **{title}** — done with failures: {failed}")
 
-    # ---- The ONLY DM ----
     try:
         dm = await ctx.author.create_dm()
         if all_ok:
@@ -891,6 +953,9 @@ async def run_movie(ctx, info, options):
     progress.upscale = options["upscale"]
     progress.owner_id = ctx.author.id
     progress.channel_id = ctx.channel.id
+    progress.total_episodes = 1
+    progress.downloaded_episodes = 0
+    progress.completed_episodes = []
     progress.save()
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
@@ -908,8 +973,64 @@ async def run_movie(ctx, info, options):
     )
 
     if ok:
+        progress.downloaded_episodes = 1
+        progress.completed_episodes = [["movie", "movie"]]
+        progress.completed = True
+        progress.save()
         await ctx.send(f"🎉 **{title}** — downloaded!")
     else:
+        progress.save()
+        await ctx.send(f"⚠️ **{title}** — failed.")
+
+    try:
+        dm = await ctx.author.create_dm()
+        if ok:
+            await dm.send(f"🎉 Done!\n**{title}** downloaded successfully.")
+        else:
+            await dm.send(f"⚠️ **{title}** — download failed.")
+    except Exception as e:
+        print(f"[dm] {e}")
+
+
+async def run_movie_with_url(ctx, info, options, url):
+    """Download directly from a provided m3u8 URL — skips Chrome/clipboard."""
+    title = info["title"]
+
+    progress = DownloadProgress()
+    progress.title = title
+    progress.imdb_id = "manual"
+    progress.quality_choice = options["quality"]
+    progress.additional_choice = options["additional"]
+    progress.subtitles = options["subtitles"]
+    progress.upscale = options["upscale"]
+    progress.owner_id = ctx.author.id
+    progress.channel_id = ctx.channel.id
+    progress.total_episodes = 1
+    progress.downloaded_episodes = 0
+    progress.completed_episodes = []
+    progress.save()
+
+    save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
+
+    loop = asyncio.get_running_loop()
+
+    ok = await asyncio.to_thread(
+        download_from_url,
+        url, title, None, progress,
+        lambda m: notify(ctx.channel, m),
+        loop,
+        ctx.channel,
+        True, 0
+    )
+
+    if ok:
+        progress.downloaded_episodes = 1
+        progress.completed_episodes = [["movie", "movie"]]
+        progress.completed = True
+        progress.save()
+        await ctx.send(f"🎉 **{title}** — downloaded!")
+    else:
+        progress.save()
         await ctx.send(f"⚠️ **{title}** — failed.")
 
     try:
@@ -923,11 +1044,166 @@ async def run_movie(ctx, info, options):
 
 
 # =============================================================
+# Download queue
+# =============================================================
+class _StubUser:
+    def __init__(self, uid):
+        self.id = uid
+
+    async def create_dm(self):
+        return await bot.create_dm(discord.Object(id=self.id))
+
+
+class _JobCtx:
+    def __init__(self, channel, author):
+        self.channel = channel
+        self.author = author
+
+    async def send(self, m):
+        await self.channel.send(m)
+
+
+class Job:
+    def __init__(self, kind, ctx, info, options, selection=None):
+        self.job_id = next(job_id_counter)
+        self.kind = kind
+        self.owner_id = ctx.author.id
+        self.owner_label = f"<@{ctx.author.id}>"
+        self.channel = ctx.channel
+        self.author = ctx.author
+        self.ctx = ctx
+        self.info = info
+        self.options = options
+        self.selection = selection
+        self.title = info.get("title", "")
+        self.status = "queued"
+        self.task = None
+        self.done_event = asyncio.Event()
+        self.manual_url = None
+
+    def describe(self):
+        try:
+            if self.kind == "series":
+                sel = self.selection or []
+                total = len(sel)
+                seasons = sorted({s for s, _ in sel})
+                if len(seasons) == 1:
+                    sn = seasons[0]
+                    full = self.info.get("seasons", {}).get(sn)
+                    label = f"S{sn}"
+                    if full and total == full:
+                        label += " (full)"
+                    else:
+                        label += f" · {total} eps"
+                elif seasons:
+                    label = "S" + ",".join(str(s) for s in seasons) + f" · {total} eps"
+                else:
+                    label = f"{total} eps"
+                return f"📺 {self.title} ({label})"
+            if self.kind == "movie_url":
+                return f"🔗 {self.title} (manual)"
+            return f"🎬 {self.title}"
+        except Exception:
+            prefix = "📺" if self.kind == "series" else "🎬"
+            return f"{prefix} {self.title}"
+
+
+job_queue = deque()
+job_id_counter = itertools.count(1)
+job_cond = asyncio.Condition()
+queue_worker_task = None
+
+
+def ensure_queue_worker():
+    global queue_worker_task
+    if queue_worker_task is None or queue_worker_task.done():
+        queue_worker_task = asyncio.create_task(run_queue_worker())
+        print("[worker] queue worker started")
+
+
+async def _notify_cond():
+    async with job_cond:
+        job_cond.notify_all()
+
+
+def enqueue(job):
+    job_queue.append(job)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_notify_cond())
+    except RuntimeError:
+        pass
+    return 1 + sum(1 for j in job_queue
+                   if j.status in ("queued", "running") and j is not job)
+
+
+def prune_queue():
+    while job_queue and job_queue[0].status in ("done", "cancelled"):
+        job_queue.popleft()
+
+
+def queue_status_text():
+    jobs = [j for j in job_queue if j.status in ("queued", "running")]
+    if not jobs:
+        return "📭 No jobs in the queue."
+    lines = ["⏳ **Download queue:**"]
+    for pos, j in enumerate(jobs, 1):
+        icon = "▶️" if j.status == "running" else "⏳"
+        lines.append(f"{pos}. {icon} `#{j.job_id}` — {j.describe()} — by {j.owner_label}")
+    return "\n".join(lines)
+
+
+async def run_job(job):
+    try:
+        if job.kind == "series":
+            await run_series(job.ctx, job.info, job.options, job.selection)
+        elif job.kind == "movie":
+            await run_movie(job.ctx, job.info, job.options)
+        elif job.kind == "movie_url":
+            await run_movie_with_url(job.ctx, job.info, job.options, job.manual_url)
+        job.status = "done"
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        await notify(job.channel, f"🛑 Job #{job.job_id} cancelled.")
+        raise
+    except Exception as e:
+        print(f"[queue worker] {e}")
+        import traceback; traceback.print_exc()
+        job.status = "cancelled"
+        try:
+            await notify(job.channel, f"⚠️ Job #{job.job_id} crashed: {e}")
+        except Exception:
+            pass
+    finally:
+        job.done_event.set()
+        async with job_cond:
+            prune_queue()
+            job_cond.notify_all()
+
+
+async def run_queue_worker():
+    print("[worker] loop running")
+    while True:
+        job = None
+        async with job_cond:
+            while job is None:
+                job = next((j for j in job_queue if j.status == "queued"), None)
+                if job is None:
+                    await job_cond.wait()
+            job.status = "running"
+        print(f"[worker] starting job #{job.job_id}: {job.describe()}")
+        await notify(job.channel, f"▶️ **Job #{job.job_id} starting**: {job.describe()}")
+        job.task = asyncio.create_task(run_job(job))
+        await job.done_event.wait()
+
+
+# =============================================================
 # Bot events
 # =============================================================
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    ensure_queue_worker()
 
     p = DownloadProgress.load()
     if not p or p.completed:
@@ -941,6 +1217,10 @@ async def on_ready():
     owner_id   = state.get("owner_id")   or getattr(p, "owner_id", 0)
     if not channel_id:
         print("[resume] No saved channel — skipping auto-resume.")
+        return
+
+    if p.imdb_id == "manual":
+        print("[resume] Skipping manual download resume.")
         return
 
     channel = bot.get_channel(channel_id)
@@ -965,24 +1245,13 @@ async def on_ready():
         "upscale": p.upscale,
     }
 
-    class _User:
-        def __init__(self, uid):
-            self.id = uid
-        async def create_dm(self):
-            return await bot.create_dm(discord.Object(id=self.id))
-
-    class _Ctx:
-        def __init__(self, ch, uid):
-            self.channel = ch
-            self.author = _User(uid)
-        async def send(self, m):
-            await self.channel.send(m)
-
     selection = p.selected_episodes or \
         [(s, e) for s in sorted(p.season_episode_counts)
          for e in range(1, p.season_episode_counts[s] + 1)]
 
-    asyncio.create_task(run_series(_Ctx(channel, owner_id), info, opts, selection))
+    job = Job("series", _JobCtx(channel, _StubUser(owner_id)), info, opts, selection)
+    enqueue(job)
+    await channel.send(f"♻️ Auto-resume queued as job #{job.job_id}.")
 
 
 # =============================================================
@@ -994,9 +1263,7 @@ async def dl(ctx, *, query: str):
         await ctx.send("⛔ Not authorized.")
         return
 
-    if ctx.author.id in active_jobs and not active_jobs[ctx.author.id].done():
-        await ctx.send("⚠️ You already have a job running.")
-        return
+    ensure_queue_worker()
 
     await ctx.send(f"🔍 Searching IMDb for `{query}`…")
     results = search_imdb(query, limit=5)
@@ -1006,7 +1273,7 @@ async def dl(ctx, *, query: str):
 
     lines = []
     for i, r in enumerate(results, 1):
-        cat = classify(r.get('q', ''))
+        cat = classify(r.get('q', ''), r.get('qid', ''))
         lines.append(f"{i}. `{r.get('id')}` — {r.get('l')} ({r.get('y','?')}) [{cat}]")
     await ctx.send("**Results:**\n" + "\n".join(lines) +
                    "\nReply with the number (or `0` to cancel).")
@@ -1033,7 +1300,7 @@ async def dl(ctx, *, query: str):
 
     imdb_id = result.get("id")
     title = result.get("l")
-    category = classify(result.get("q", ""))
+    category = classify(result.get("q", ""), result.get("qid", ""))
 
     await ctx.send(f"📋 **{title}** — `{imdb_id}` — {category}")
 
@@ -1103,18 +1370,55 @@ async def dl(ctx, *, query: str):
             await ctx.send("❌ Could not parse selection. Aborting.")
             return
 
-        await ctx.send(f"▶️ {len(selection)} episodes selected. Starting…")
+        await ctx.send(f"▶️ {len(selection)} episodes selected.")
 
-        task = asyncio.create_task(run_series(ctx, info, options, selection))
-        active_jobs[ctx.author.id] = task
-        await task
-        active_jobs.pop(ctx.author.id, None)
+        job = Job("series", _JobCtx(ctx.channel, ctx.author), info, options, selection)
+        position = enqueue(job)
+        await ctx.send(f"⏳ Queued as job #{job.job_id} — position **{position}** in the queue.")
+        return
 
     else:
-        task = asyncio.create_task(run_movie(ctx, info, options))
-        active_jobs[ctx.author.id] = task
-        await task
-        active_jobs.pop(ctx.author.id, None)
+        job = Job("movie", _JobCtx(ctx.channel, ctx.author), info, options)
+        position = enqueue(job)
+        await ctx.send(f"⏳ Queued as job #{job.job_id} — position **{position}** in the queue.")
+
+
+@bot.command(name="dlurl")
+async def dlurl(ctx, url: str, *, title: str = None):
+    """Manual override: !dlurl <m3u8_url> [optional title]"""
+    if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
+        await ctx.send("⛔ Not authorized.")
+        return
+
+    ensure_queue_worker()
+
+    if ".m3u8" not in url or not url.startswith("http"):
+        await ctx.send("❌ That doesn't look like an m3u8 URL.")
+        return
+
+    if not title:
+        title = "manual_download"
+
+    await ctx.send(f"📋 Manual URL: `{url[:80]}…`\nTitle: **{title}**")
+
+    quality    = await ask_quality_in_channel(ctx)
+    additional = await ask_mode_in_channel(ctx)
+    subs       = await ask_yesno_in_channel(ctx, "💬 **Download subtitles?**")
+    upscale    = await ask_yesno_in_channel(ctx, "🔼 **Upscale to 4K if not already 4K?**")
+
+    options = {
+        "quality": quality,
+        "additional": additional,
+        "subtitles": subs,
+        "upscale": upscale,
+    }
+
+    info = {"imdb_id": "manual", "title": title, "type": "movie"}
+
+    job = Job("movie_url", _JobCtx(ctx.channel, ctx.author), info, options)
+    job.manual_url = url
+    position = enqueue(job)
+    await ctx.send(f"⏳ Queued as job #{job.job_id} — position **{position}** in the queue.")
 
 
 @bot.command(name="status")
@@ -1125,22 +1429,70 @@ async def status(ctx):
     if not p:
         await ctx.send("📭 No saved progress.")
         return
+
     done = len(getattr(p, "completed_episodes", []))
-    await ctx.send(
-        f"📊 **{p.title}** — {p.percent():.1f}% "
-        f"({done}/{p.total_episodes} episodes complete)"
-        + (f"\n❌ Failed: {len(p.failed_episodes)}" if p.failed_episodes else "")
+    total = p.total_episodes or 1
+
+    is_movie = (
+        p.total_episodes == 1
+        and not p.season_episode_counts
+        and (p.completed_episodes == [["movie", "movie"]] or not p.selected_episodes)
     )
+
+    if is_movie:
+        state = "✅ downloaded" if p.completed else "⏳ not downloaded"
+        msg = f"📊 **{p.title}** — {state}"
+        if p.failed_episodes:
+            msg += f"\n❌ Failed: {len(p.failed_episodes)}"
+        await ctx.send(msg)
+    else:
+        await ctx.send(
+            f"📊 **{p.title}** — {p.percent():.1f}% "
+            f"({done}/{total} episodes complete)"
+            + (f"\n❌ Failed: {len(p.failed_episodes)}" if p.failed_episodes else "")
+        )
+
+
+@bot.command(name="queue")
+async def queue_cmd(ctx):
+    if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
+        return
+    await ctx.send(queue_status_text())
 
 
 @bot.command(name="cancel")
-async def cancel(ctx):
+async def cancel(ctx, job_id: int = None):
     if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
         return
-    task = active_jobs.get(ctx.author.id)
-    if task and not task.done():
-        task.cancel()
-        await ctx.send("🛑 Cancelled.")
+
+    if job_id is not None:
+        job = next((j for j in job_queue
+                    if j.job_id == job_id and j.owner_id == ctx.author.id
+                    and j.status in ("queued", "running")), None)
+        if job is None:
+            await ctx.send(f"❌ No active job #{job_id} of yours found.")
+            return
+        if job.status == "queued":
+            job_queue.remove(job)
+            await ctx.send(f"✅ Removed job #{job.job_id} from the queue.")
+        else:
+            if job.task:
+                job.task.cancel()
+            await ctx.send(f"🛑 Cancelling job #{job.job_id}…")
+        return
+
+    job = next((j for j in job_queue
+                if j.owner_id == ctx.author.id and j.status == "running"), None)
+    if job:
+        if job.task:
+            job.task.cancel()
+        await ctx.send(f"🛑 Cancelling job #{job.job_id}…")
+        return
+    queued = next((j for j in job_queue
+                   if j.owner_id == ctx.author.id and j.status == "queued"), None)
+    if queued:
+        await ctx.send(f"⚠️ Nothing running. Use `!cancel {queued.job_id}` "
+                       "to remove your queued job.")
     else:
         await ctx.send("Nothing running.")
 
