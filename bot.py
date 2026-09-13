@@ -20,9 +20,11 @@ import re
 import json
 import pickle
 import asyncio
+import itertools
 import requests
 import threading
 import queue
+from collections import deque
 from datetime import datetime
 
 import discord
@@ -63,8 +65,6 @@ HEADERS = {
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-
-active_jobs = {}
 
 
 # =============================================================
@@ -923,6 +923,144 @@ async def run_movie(ctx, info, options):
 
 
 # =============================================================
+# Download queue
+# =============================================================
+class _StubUser:
+    def __init__(self, uid):
+        self.id = uid
+
+    async def create_dm(self):
+        return await bot.create_dm(discord.Object(id=self.id))
+
+
+class _JobCtx:
+    """Minimal ctx replacement so a job can run after the !dl command returns."""
+    def __init__(self, channel, author):
+        self.channel = channel
+        self.author = author
+
+    async def send(self, m):
+        await self.channel.send(m)
+
+
+class Job:
+    def __init__(self, kind, ctx, info, options, selection=None):
+        self.job_id = next(job_id_counter)
+        self.kind = kind
+        self.owner_id = ctx.author.id
+        self.owner_label = f"<@{ctx.author.id}>"
+        self.channel = ctx.channel
+        self.author = ctx.author
+        self.ctx = ctx
+        self.info = info
+        self.options = options
+        self.selection = selection
+        self.title = info.get("title", "")
+        self.status = "queued"
+        self.task = None
+        self.done_event = asyncio.Event()
+
+    def describe(self):
+        try:
+            if self.kind == "series":
+                sel = self.selection or []
+                total = len(sel)
+                seasons = sorted({s for s, _ in sel})
+                if len(seasons) == 1:
+                    sn = seasons[0]
+                    full = self.info.get("seasons", {}).get(sn)
+                    label = f"S{sn}"
+                    if full and total == full:
+                        label += " (full)"
+                    else:
+                        label += f" · {total} eps"
+                elif seasons:
+                    label = "S" + ",".join(str(s) for s in seasons) + f" · {total} eps"
+                else:
+                    label = f"{total} eps"
+                return f"📺 {self.title} ({label})"
+            return f"🎬 {self.title}"
+        except Exception:
+            prefix = "📺" if self.kind == "series" else "🎬"
+            return f"{prefix} {self.title}"
+
+
+job_queue = deque()
+job_id_counter = itertools.count(1)
+job_cond = asyncio.Condition()
+queue_worker_task = None
+
+
+def ensure_queue_worker():
+    global queue_worker_task
+    if queue_worker_task is None or queue_worker_task.done():
+        queue_worker_task = asyncio.create_task(run_queue_worker())
+
+
+def enqueue(job):
+    """Add a job to the queue. Returns its 1-based position (1 = next to run)."""
+    job_queue.append(job)
+    return 1 + sum(1 for j in job_queue
+                   if j.status in ("queued", "running") and j is not job)
+
+
+def prune_queue():
+    while job_queue and job_queue[0].status in ("done", "cancelled"):
+        job_queue.popleft()
+
+
+def queue_status_text():
+    jobs = [j for j in job_queue if j.status in ("queued", "running")]
+    if not jobs:
+        return "📭 No jobs in the queue."
+    lines = ["⏳ **Download queue:**"]
+    for pos, j in enumerate(jobs, 1):
+        icon = "▶️" if j.status == "running" else "⏳"
+        lines.append(f"{pos}. {icon} `#{j.job_id}` — {j.describe()} — by {j.owner_label}")
+    return "\n".join(lines)
+
+
+async def run_job(job):
+    try:
+        if job.kind == "series":
+            await run_series(job.ctx, job.info, job.options, job.selection)
+        else:
+            await run_movie(job.ctx, job.info, job.options)
+        job.status = "done"
+    except asyncio.CancelledError:
+        job.status = "cancelled"
+        await notify(job.channel, f"🛑 Job #{job.job_id} cancelled.")
+        raise
+    except Exception as e:
+        print(f"[queue worker] {e}")
+        job.status = "cancelled"
+        try:
+            await notify(job.channel, f"⚠️ Job #{job.job_id} crashed: {e}")
+        except Exception:
+            pass
+    finally:
+        job.done_event.set()
+        async with job_cond:
+            prune_queue()
+            job_cond.notify_all()
+
+
+async def run_queue_worker():
+    """Only one download runs at a time; everything else waits in line."""
+    while True:
+        job = None
+        async with job_cond:
+            while job is None:
+                job = next((j for j in job_queue if j.status == "queued"), None)
+                if job is None:
+                    await job_cond.wait()
+            job.status = "running"
+        await notify(job.channel, f"▶️ **Job #{job.job_id} starting**: {job.describe()}")
+        job.task = asyncio.create_task(run_job(job))
+        await job.done_event.wait()
+
+
+# =============================================================
 # Bot events
 # =============================================================
 @bot.event
@@ -965,24 +1103,14 @@ async def on_ready():
         "upscale": p.upscale,
     }
 
-    class _User:
-        def __init__(self, uid):
-            self.id = uid
-        async def create_dm(self):
-            return await bot.create_dm(discord.Object(id=self.id))
-
-    class _Ctx:
-        def __init__(self, ch, uid):
-            self.channel = ch
-            self.author = _User(uid)
-        async def send(self, m):
-            await self.channel.send(m)
-
     selection = p.selected_episodes or \
         [(s, e) for s in sorted(p.season_episode_counts)
          for e in range(1, p.season_episode_counts[s] + 1)]
 
-    asyncio.create_task(run_series(_Ctx(channel, owner_id), info, opts, selection))
+    ensure_queue_worker()
+    job = Job("series", _JobCtx(channel, _StubUser(owner_id)), info, opts, selection)
+    enqueue(job)
+    await channel.send(f"♻️ Auto-resume queued as job #{job.job_id}.")
 
 
 # =============================================================
@@ -994,9 +1122,7 @@ async def dl(ctx, *, query: str):
         await ctx.send("⛔ Not authorized.")
         return
 
-    if ctx.author.id in active_jobs and not active_jobs[ctx.author.id].done():
-        await ctx.send("⚠️ You already have a job running.")
-        return
+    ensure_queue_worker()
 
     await ctx.send(f"🔍 Searching IMDb for `{query}`…")
     results = search_imdb(query, limit=5)
@@ -1103,18 +1229,17 @@ async def dl(ctx, *, query: str):
             await ctx.send("❌ Could not parse selection. Aborting.")
             return
 
-        await ctx.send(f"▶️ {len(selection)} episodes selected. Starting…")
+        await ctx.send(f"▶️ {len(selection)} episodes selected.")
 
-        task = asyncio.create_task(run_series(ctx, info, options, selection))
-        active_jobs[ctx.author.id] = task
-        await task
-        active_jobs.pop(ctx.author.id, None)
+        job = Job("series", _JobCtx(ctx.channel, ctx.author), info, options, selection)
+        position = enqueue(job)
+        await ctx.send(f"⏳ Queued as job #{job.job_id} — position **{position}** in the queue.")
+        return
 
     else:
-        task = asyncio.create_task(run_movie(ctx, info, options))
-        active_jobs[ctx.author.id] = task
-        await task
-        active_jobs.pop(ctx.author.id, None)
+        job = Job("movie", _JobCtx(ctx.channel, ctx.author), info, options)
+        position = enqueue(job)
+        await ctx.send(f"⏳ Queued as job #{job.job_id} — position **{position}** in the queue.")
 
 
 @bot.command(name="status")
@@ -1133,14 +1258,46 @@ async def status(ctx):
     )
 
 
-@bot.command(name="cancel")
-async def cancel(ctx):
+@bot.command(name="queue")
+async def queue(ctx):
     if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
         return
-    task = active_jobs.get(ctx.author.id)
-    if task and not task.done():
-        task.cancel()
-        await ctx.send("🛑 Cancelled.")
+    await ctx.send(queue_status_text())
+
+
+@bot.command(name="cancel")
+async def cancel(ctx, job_id: int = None):
+    if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
+        return
+
+    if job_id is not None:
+        job = next((j for j in job_queue
+                    if j.job_id == job_id and j.owner_id == ctx.author.id
+                    and j.status in ("queued", "running")), None)
+        if job is None:
+            await ctx.send(f"❌ No active job #{job_id} of yours found.")
+            return
+        if job.status == "queued":
+            job_queue.remove(job)
+            await ctx.send(f"✅ Removed job #{job.job_id} from the queue.")
+        else:
+            if job.task:
+                job.task.cancel()
+            await ctx.send(f"🛑 Cancelling job #{job.job_id}…")
+        return
+
+    job = next((j for j in job_queue
+                if j.owner_id == ctx.author.id and j.status == "running"), None)
+    if job:
+        if job.task:
+            job.task.cancel()
+        await ctx.send(f"🛑 Cancelling job #{job.job_id}…")
+        return
+    queued = next((j for j in job_queue
+                   if j.owner_id == ctx.author.id and j.status == "queued"), None)
+    if queued:
+        await ctx.send(f"⚠️ Nothing running. Use `!cancel {queued.job_id}` "
+                       "to remove your queued job.")
     else:
         await ctx.send("Nothing running.")
 
