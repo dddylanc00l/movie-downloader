@@ -142,12 +142,14 @@ def resume_upscale(source_file):
 
     cmd = [
         'ffmpeg',
+        '-err_detect', 'explode', '-xerror',
         '-i', source_file,
         '-vf', 'scale=3840:2160:flags=lanczos',
         '-c:v', 'libx264',
         '-crf', '18',
         '-preset', 'medium',
         '-c:a', 'copy',
+        '-movflags', '+faststart',
         '-y',
         output
     ]

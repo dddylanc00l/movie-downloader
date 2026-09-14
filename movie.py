@@ -293,6 +293,7 @@ def upscale_to_4k(input_file, output_file=None):
 
     cmd = [
         'ffmpeg',
+        '-err_detect', 'explode', '-xerror',
         '-i', input_file,
         '-vf', 'scale=3840:2160:flags=lanczos',
         '-c:v', 'libx264',

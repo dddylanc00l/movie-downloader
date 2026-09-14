@@ -138,6 +138,137 @@ def get_live_status(job_id):
 
 
 # =============================================================
+# Background upscale worker
+# =============================================================
+# Downloads push files onto UPSCALE_QUEUE and continue immediately, so the
+# next download can run while ffmpeg is busy encoding a previous file.
+UPSCALE_QUEUE = queue.Queue()
+UPSCALE_ACTIVITY = {}
+UPSCALE_ACTIVITY_LOCK = threading.Lock()
+upscale_id_counter = itertools.count(1)
+_upscale_thread = None
+
+
+def register_upscale_activity(up_id, job_id, label, text):
+    with UPSCALE_ACTIVITY_LOCK:
+        UPSCALE_ACTIVITY[up_id] = {
+            "job_id": job_id, "label": label, "text": text, "ts": time.time()
+        }
+
+
+def set_upscale_activity(up_id, text):
+    with UPSCALE_ACTIVITY_LOCK:
+        entry = UPSCALE_ACTIVITY.get(up_id)
+        if entry:
+            entry["text"] = text
+            entry["ts"] = time.time()
+
+
+def clear_upscale_activity(up_id):
+    with UPSCALE_ACTIVITY_LOCK:
+        UPSCALE_ACTIVITY.pop(up_id, None)
+
+
+def get_upscale_activities():
+    with UPSCALE_ACTIVITY_LOCK:
+        return [dict(e) for e in UPSCALE_ACTIVITY.values()]
+
+
+def ensure_upscale_worker():
+    global _upscale_thread
+    if _upscale_thread is None or not _upscale_thread.is_alive():
+        _upscale_thread = threading.Thread(target=_run_upscale_worker, daemon=True)
+        _upscale_thread.start()
+        print("[upscale] background upscale worker started")
+
+
+def _upscale_post(loop, channel, text):
+    async def _send():
+        try:
+            await channel.send(text)
+        except Exception as e:
+            print(f"[upscale post] {e}")
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), loop).result()
+    except Exception as e:
+        print(f"[upscale post] {e}")
+
+
+def _run_upscale_worker():
+    while True:
+        item = UPSCALE_QUEUE.get()
+        if item is None:
+            break
+        up_id = item["up_id"]
+        try:
+            job_id = item["job_id"]
+            label = item["label"]
+            input_file = item["input"]
+            cancel_event = item.get("cancel_event")
+            loop = item.get("loop")
+            channel = item.get("channel")
+            set_status = item.get("set_status")
+
+            def post(text):
+                if loop is not None and channel is not None:
+                    _upscale_post(loop, channel, text)
+
+            if cancel_event and cancel_event.is_set():
+                clear_upscale_activity(up_id)
+                continue
+
+            if set_status:
+                set_status(f"🔼 Upscaling {os.path.basename(input_file)}…", force=True)
+            register_upscale_activity(
+                up_id, job_id, label,
+                f"⏳ queued — {os.path.basename(input_file)}"
+            )
+
+            def status_cb(m):
+                set_upscale_activity(up_id, m)
+                if set_status:
+                    set_status(m, force=True)
+
+            result = upscale_to_4k(input_file,
+                                   status_cb=status_cb,
+                                   delete_source=True,
+                                   cancel_event=cancel_event)
+
+            if cancel_event and cancel_event.is_set():
+                post(f"🛑 Upscale cancelled: {os.path.basename(input_file)}")
+            elif result:
+                post(f"✅ Upgraded to 4K: {os.path.basename(result)}")
+            else:
+                post(f"❌ Upscale failed: {os.path.basename(input_file)} "
+                     f"— source kept, will retry later")
+            clear_upscale_activity(up_id)
+        except Exception as e:
+            print(f"[upscale worker] {e}")
+            import traceback; traceback.print_exc()
+            try:
+                clear_upscale_activity(up_id)
+            except Exception:
+                pass
+
+
+def enqueue_upscale(input_file, job_id, label, cancel_event=None,
+                    loop=None, channel=None, set_status=None):
+    up_id = next(upscale_id_counter)
+    UPSCALE_QUEUE.put({
+        "up_id": up_id,
+        "job_id": job_id,
+        "label": label,
+        "input": input_file,
+        "cancel_event": cancel_event,
+        "loop": loop,
+        "channel": channel,
+        "set_status": set_status,
+    })
+    ensure_upscale_worker()
+    return up_id
+
+
+# =============================================================
 # Movie downloads state
 # =============================================================
 class MovieDownloadsState:
@@ -401,11 +532,14 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
     if status_cb: status_cb(f"🔼 Upscaling {os.path.basename(input_file)} to 4K…")
 
     cmd = [
-        'ffmpeg', '-i', input_file,
+        'ffmpeg',
+        '-err_detect', 'explode', '-xerror',
+        '-i', input_file,
         '-vf', 'scale=3840:2160:flags=lanczos',
         '-c:v', 'libx264',
         '-crf', '18', '-preset', 'faster',
         '-c:a', 'copy',
+        '-movflags', '+faststart',
         '-y', output_file
     ]
 
@@ -477,6 +611,107 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
                 status_cb(f"⚠️ Could not delete original: {e}")
 
     return output_file
+
+
+def find_downloaded_file(base_name):
+    for f in os.listdir(MOVIES_FOLDER):
+        if f.startswith(base_name) and not f.endswith(".part") \
+                and "_4k" not in f and os.path.isfile(
+                    os.path.join(MOVIES_FOLDER, f)):
+            return os.path.join(MOVIES_FOLDER, f)
+    return None
+
+
+def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
+    """
+    Make a downloaded MP4 seekable/skippable by writing the moov atom to the
+    front (-movflags +faststart) and fail on any container/bitstream error
+    (-err_detect explode -xerror) so a corrupted/glitchy download is caught.
+    Stream copy only — no re-encode, so it's fast and CPU-cheap.
+    """
+    if not os.path.exists(input_file):
+        if status_cb: status_cb("❌ File not found for faststart pass.")
+        return None
+
+    base, ext = os.path.splitext(input_file)
+    if ext.lower() not in (".mp4", ".mov", ".m4a"):
+        # Only MP4-family containers benefit from +faststart; leave others
+        # untouched so e.g. audio-only webm downloads are never failed here.
+        return input_file
+
+    tmp_file = f"{base}.faststart{ext}"
+
+    if status_cb:
+        status_cb(f"🔧 Making seekable / checking glitches: {os.path.basename(input_file)}")
+
+    cmd = [
+        'ffmpeg', '-v', 'error',
+        '-err_detect', 'explode', '-xerror',
+        '-i', input_file,
+        '-map', '0',
+        '-c', 'copy',
+        '-movflags', '+faststart',
+        '-y', tmp_file
+    ]
+
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, bufsize=1)
+    except FileNotFoundError:
+        if status_cb: status_cb("❌ FFmpeg not found.")
+        return None
+
+    q = queue.Queue()
+
+    def reader():
+        for line in iter(process.stderr.readline, ''):
+            if line: q.put(line.rstrip())
+        process.stderr.close()
+    threading.Thread(target=reader, daemon=True).start()
+
+    cancelled = False
+    while process.poll() is None or not q.empty():
+        if cancel_event and cancel_event.is_set():
+            cancelled = True
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            break
+        try:
+            line = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if "error" in line.lower():
+            if status_cb: status_cb(f"⚠️ {line[:180]}")
+
+    if cancelled:
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
+        if status_cb: status_cb("🛑 faststart pass cancelled.")
+        safe_delete(tmp_file)
+        return None
+
+    if process.returncode != 0:
+        if status_cb: status_cb("❌ faststart / glitch check failed.")
+        safe_delete(tmp_file)
+        return None
+
+    if not os.path.exists(tmp_file):
+        if status_cb: status_cb("❌ faststart output missing.")
+        return None
+
+    try:
+        os.replace(tmp_file, input_file)
+    except Exception as e:
+        if status_cb: status_cb(f"⚠️ could not replace file: {e}")
+        safe_delete(tmp_file)
+        return None
+
+    if status_cb: status_cb("✅ MP4 seekable (faststart), no glitches found.")
+    return input_file
 
 
 # =============================================================
@@ -603,33 +838,34 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     # Remove from persisted movie state
     MovieDownloadsState.load().remove(base_name)
 
-    # -- Upscale --
-    if progress.upscale and progress.additional_choice != "2" \
-            and progress.quality_choice in ("1", "2", "3"):
-        # Find whatever file yt-dlp actually created
-        actual = None
-        for f in os.listdir(MOVIES_FOLDER):
-            if f.startswith(base_name) and not f.endswith(".part") \
-                    and "_4k" not in f and os.path.isfile(
-                        os.path.join(MOVIES_FOLDER, f)):
-                actual = os.path.join(MOVIES_FOLDER, f)
-                break
+    # Locate the file yt-dlp actually created
+    actual = find_downloaded_file(base_name)
+    if not actual:
+        set_status("❌ could not find downloaded file", force=True)
+        return False
 
-        if not actual:
-            set_status("❌ could not find downloaded file for upscale", force=True)
-            return False
+    want_upscale = progress.upscale and progress.additional_choice != "2" \
+        and progress.quality_choice in ("1", "2", "3")
 
-        result = upscale_to_4k(actual,
-                               status_cb=lambda m: set_status(m, force=True),
-                               delete_source=True,
-                               cancel_event=cancel_event)
+    if want_upscale:
+        # Hand the file to the background upscale worker so the next
+        # download can start immediately while ffmpeg encodes this one.
+        enqueue_upscale(actual, job_id=job_id, label=base_name,
+                        cancel_event=cancel_event,
+                        loop=loop, channel=channel,
+                        set_status=set_status)
+    elif progress.additional_choice != "2":
+        # Non-upscaled video files get a faststart remux so they are
+        # seekable/skippable and get checked for encoding glitches.
+        result = verify_and_faststart(actual,
+                                      status_cb=lambda m: set_status(m, force=True),
+                                      cancel_event=cancel_event)
         if not result:
             if cancelled():
-                set_status("🛑 cancelled during upscale", force=True)
-                # Delete the non-4K source too since user cancelled
+                set_status("🛑 cancelled during post-processing", force=True)
                 safe_delete(actual)
                 return False
-            set_status("❌ upscale failed — will retry next time", force=True)
+            set_status("❌ glitch/corruption detected — will retry later", force=True)
             return False
 
     set_status("✅ done", force=True)
@@ -1714,6 +1950,8 @@ async def status(ctx):
     if ALLOWED_USER_ID and ctx.author.id != ALLOWED_USER_ID:
         return
 
+    parts = []
+
     running_jobs = [j for j in job_queue if j.status == "running"]
     if running_jobs:
         lines = []
@@ -1723,7 +1961,18 @@ async def status(ctx):
                 lines.append(f"▶️ **#{j.job_id}** {j.describe()}\n`{live}`")
             else:
                 lines.append(f"▶️ **#{j.job_id}** {j.describe()}\n_(starting…)_")
-        await ctx.send("**Live status:**\n" + "\n".join(lines))
+        parts.append("**Live status:**\n" + "\n".join(lines))
+
+    upscales = get_upscale_activities()
+    if upscales:
+        ulines = []
+        for u in sorted(upscales, key=lambda e: e.get("job_id", 0)):
+            job_ref = f"#{u['job_id']}" if u.get("job_id") else "-"
+            ulines.append(f"🔼 **job {job_ref}** {u.get('label', '?')}\n`{u.get('text', '…')}`")
+        parts.append("**Upscaling:**\n" + "\n".join(ulines))
+
+    if parts:
+        await ctx.send("\n\n".join(parts))
         return
 
     p = DownloadProgress.load()
