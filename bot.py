@@ -52,6 +52,7 @@ YTDLP_MODULE = "yt_dlp"
 # Tunables
 CONCURRENT_FRAGMENTS = 5
 STATUS_EDIT_INTERVAL = 8.0
+SUBTITLE_LANGS = "en.*,nl.*"   # subtitle languages to fetch (en = English, nl = Dutch)
 
 # =============================================================
 # Setup
@@ -94,22 +95,36 @@ def safe_delete(path):
 def cleanup_download_artifacts(output_prefix):
     """
     Remove every file matching a download prefix (partials, parts,
-    yt-dlp metadata, and the temp fragment directory).
+    yt-dlp metadata, and the temp fragment directory), recursively so
+    series files inside show/season subfolders are covered too.
     """
     try:
-        for f in os.listdir(MOVIES_FOLDER):
-            full = os.path.join(MOVIES_FOLDER, f)
-            # Skip the temp dir itself
-            if os.path.isdir(full):
-                continue
-            # Match anything starting with the prefix, including
-            # .part, .ytdl, .f*.mp4 fragment files, etc.
-            if f.startswith(output_prefix):
-                safe_delete(full)
+        touched_dirs = set()
+        for root, dirs, files in os.walk(MOVIES_FOLDER):
+            # Skip the yt-dlp temp fragment dir; handled below
+            dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+            removed = False
+            for f in files:
+                if f.startswith(output_prefix):
+                    safe_delete(os.path.join(root, f))
+                    removed = True
+            if removed:
+                touched_dirs.add(root)
         # Also nuke any yt-dlp fragment dir for this download
         for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
             if entry.startswith(output_prefix):
                 safe_delete(os.path.join(MOVIES_FOLDER, TEMP_FOLDER, entry))
+        # Prune show/season folders that ended up empty
+        for d in sorted(touched_dirs, key=lambda x: x.count(os.sep), reverse=True):
+            cur = d
+            while cur != MOVIES_FOLDER and os.path.isdir(cur):
+                try:
+                    if os.listdir(cur):
+                        break
+                    os.rmdir(cur)
+                    cur = os.path.dirname(cur)
+                except Exception:
+                    break
     except Exception as e:
         print(f"[cleanup] {e}")
 
@@ -438,51 +453,55 @@ def search_imdb(query, limit=5):
 
 
 def get_series_info(imdb_id):
+    """Episode counts per season from TVMaze (key-free JSON API)."""
     seasons = {}
     try:
-        r = requests.get(f"https://www.imdb.com/title/{imdb_id}/episodes",
+        r = requests.get(f"https://api.tvmaze.com/lookup/shows?imdb={imdb_id}",
                          headers=HEADERS, timeout=15)
         r.raise_for_status()
-        text = r.text
+        show_id = r.json()["id"]
     except Exception as e:
-        print(f"[imdb episodes] {e}")
+        print(f"[series info] lookup failed: {e}")
         return {}
 
-    season_nums = []
-    for pat in [
-        r'<option[^>]*value="(\d+)"[^>]*>',
-        r'data-season-number="(\d+)"',
-        r'Season\s+(\d+)',
-    ]:
-        found = re.findall(pat, text)
-        if found:
-            season_nums = sorted({int(s) for s in found if str(s).isdigit()})
-            break
-
-    for s in season_nums:
-        try:
-            sr = requests.get(
-                f"https://www.imdb.com/title/{imdb_id}/episodes?season={s}",
-                headers=HEADERS, timeout=15)
-            sr.raise_for_status()
-            st = sr.text
-        except Exception:
-            continue
-
-        count = 0
-        c = re.findall(r'episode-container', st)
-        if c:
-            count = len(c)
-        else:
-            c = re.findall(rf'/title/tt\d+/episodes\?season={s}&episode=(\d+)', st)
-            if c:
-                count = len(set(c))
+    try:
+        sr = requests.get(f"https://api.tvmaze.com/shows/{show_id}/seasons",
+                          headers=HEADERS, timeout=15)
+        sr.raise_for_status()
+        for season in sr.json():
+            number = season.get("number")
+            order = season.get("episodeOrder")
+            if number is None:
+                continue
+            if order:
+                seasons[number] = order
             else:
-                c = re.findall(r'itemprop="episode"', st)
-                if c:
-                    count = len(c)
-        if count > 0:
-            seasons[s] = count
+                seasons[number] = 0   # resolved via /episodes below
+    except Exception as e:
+        print(f"[series info] seasons failed: {e}")
+        return {}
+
+    unresolved = [n for n, c in seasons.items() if c == 0]
+    if unresolved:
+        try:
+            er = requests.get(f"https://api.tvmaze.com/shows/{show_id}/episodes",
+                              headers=HEADERS, timeout=20)
+            er.raise_for_status()
+            max_ep = {}
+            for ep in er.json():
+                sn = ep.get("season")
+                num = ep.get("number")
+                if sn is not None and num is not None:
+                    max_ep[sn] = max(max_ep.get(sn, 0), num)
+            for n in unresolved:
+                if max_ep.get(n):
+                    seasons[n] = max_ep[n]
+                else:
+                    seasons.pop(n, None)
+        except Exception as e:
+            print(f"[series info] episodes fallback failed: {e}")
+
+    seasons = {n: c for n, c in sorted(seasons.items()) if c}
     return seasons
 
 
@@ -614,11 +633,22 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
 
 
 def find_downloaded_file(base_name):
-    for f in os.listdir(MOVIES_FOLDER):
-        if f.startswith(base_name) and not f.endswith(".part") \
-                and "_4k" not in f and os.path.isfile(
-                    os.path.join(MOVIES_FOLDER, f)):
-            return os.path.join(MOVIES_FOLDER, f)
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if f.startswith(base_name) and not f.endswith(".part") \
+                    and "_4k" not in f:
+                return os.path.join(root, f)
+    return None
+
+
+def find_subtitle_file(base_name):
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if f.startswith(base_name) and \
+                    f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
+                return os.path.join(root, f)
     return None
 
 
@@ -747,7 +777,15 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     else:
         base_name = f"video_{ts}"
 
-    out_path = os.path.join(MOVIES_FOLDER, base_name + ".%(ext)s")
+    # Series episodes land in a per-show / per-season subfolder;
+    # movies and manual downloads stay flat in the root.
+    if episode_info:
+        out_dir = os.path.join(
+            MOVIES_FOLDER, safe, f"Season_{episode_info['season']}")
+        os.makedirs(out_dir, exist_ok=True)
+    else:
+        out_dir = MOVIES_FOLDER
+    out_path = os.path.join(out_dir, base_name + ".%(ext)s")
     temp_dir = os.path.join(MOVIES_FOLDER, TEMP_FOLDER)
 
     yt_cmd = [
@@ -775,7 +813,8 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         yt_cmd += ["--remux-video", "mp4"]
 
     if progress.subtitles:
-        yt_cmd += ["--write-subs", "--sub-lang", "en"]
+        yt_cmd += ["--write-subs", "--write-auto-subs",
+                   "--sub-langs", SUBTITLE_LANGS, "--convert-subs", "srt"]
 
     yt_cmd += ["-o", out_path, "--progress", "--newline"]
 
@@ -837,6 +876,12 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
     # Remove from persisted movie state
     MovieDownloadsState.load().remove(base_name)
+
+    # Notify when requested subtitles could not be found
+    if progress.subtitles and not find_subtitle_file(base_name):
+        _upscale_post(loop, channel,
+                      f"⚠️ No subtitles available in this stream — "
+                      f"none saved for `{base_name}`")
 
     # Locate the file yt-dlp actually created
     actual = find_downloaded_file(base_name)
@@ -1082,6 +1127,20 @@ def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, cha
 # =============================================================
 # Selection parser
 # =============================================================
+def make_range_selection(start, end, seasons):
+    """Build an inclusive episode list from a (season, episode) range."""
+    (s1, e1), (s2, e2) = start, end
+    result = []
+    for sn in range(s1, s2 + 1):
+        if sn not in seasons:
+            continue
+        lo = e1 if sn == s1 else 1
+        hi = e2 if sn == s2 else seasons[sn]
+        for ep in range(lo, hi + 1):
+            result.append((sn, ep))
+    return result
+
+
 def parse_selection(user_input, seasons):
     s = (user_input or "").strip().lower()
     if s == "all":
@@ -1232,6 +1291,105 @@ class YesNoView(OwnerRestrictedView):
         self.stop()
 
 
+class RangeSeasonSelect(discord.ui.Select):
+    def __init__(self, view, side):
+        self._view = view
+        self._side = side
+        options = [discord.SelectOption(label=f"Season {s}", value=str(s))
+                   for s in view.sorted_seasons]
+        super().__init__(
+            placeholder=f"{side.title()} point — season…",
+            options=options,
+        )
+
+    async def callback(self, interaction):
+        sn = int(self.values[0])
+        ep_select = (self._view.start_episode if self._side == "start"
+                     else self._view.end_episode)
+        ep_select.options = [
+            discord.SelectOption(label=f"Episode {e}", value=str(e))
+            for e in range(1, self._view.seasons[sn] + 1)
+        ]
+        ep_select.disabled = False
+        ep_select.placeholder = f"{self._side.title()} point — episode…"
+        self._view._chosen[self._side]["season"] = sn
+        self._view._chosen[self._side]["episode"] = None
+        await interaction.response.edit_message(view=self._view)
+
+
+class RangeEpisodeSelect(discord.ui.Select):
+    def __init__(self, view, side):
+        self._view = view
+        self._side = side
+        super().__init__(
+            placeholder=f"{side.title()} point — episode…",
+            options=[discord.SelectOption(
+                label="— choose a season first —", value="0")],
+            disabled=True,
+        )
+
+    async def callback(self, interaction):
+        self._view._chosen[self._side]["episode"] = int(self.values[0])
+        await interaction.response.defer()
+
+
+class SeasonEpisodeRangeView(OwnerRestrictedView):
+    def __init__(self, owner_id, seasons, timeout=180):
+        super().__init__(owner_id, timeout=timeout)
+        self.seasons = seasons
+        self.sorted_seasons = sorted(seasons)
+        self.answer = None
+        self._chosen = {
+            "start": {"season": None, "episode": None},
+            "end": {"season": None, "episode": None},
+        }
+
+        self.start_season  = RangeSeasonSelect(self, "start")
+        self.start_episode = RangeEpisodeSelect(self, "start")
+        self.end_season    = RangeSeasonSelect(self, "end")
+        self.end_episode   = RangeEpisodeSelect(self, "end")
+        self.add_item(self.start_season)
+        self.add_item(self.start_episode)
+        self.add_item(self.end_season)
+        self.add_item(self.end_episode)
+
+        all_btn = discord.ui.Button(label="📦 All episodes",
+                                    style=discord.ButtonStyle.primary)
+        all_btn.callback = self._all
+        self.add_item(all_btn)
+
+        confirm = discord.ui.Button(label="✅ Download range",
+                                    style=discord.ButtonStyle.success)
+        confirm.callback = self._confirm
+        self.add_item(confirm)
+
+    async def _all(self, interaction):
+        s1 = self.sorted_seasons[0]
+        s2 = self.sorted_seasons[-1]
+        self.answer = ((s1, 1), (s2, self.seasons[s2]))
+        await interaction.response.defer()
+        self.stop()
+
+    async def _confirm(self, interaction):
+        start = self._chosen["start"]
+        end = self._chosen["end"]
+        if None in (start["season"], start["episode"],
+                    end["season"], end["episode"]):
+            await interaction.response.send_message(
+                "❌ Pick a season and an episode for BOTH the start and end.",
+                ephemeral=True)
+            return
+        s1, e1 = start["season"], start["episode"]
+        s2, e2 = end["season"], end["episode"]
+        if (s2, e2) < (s1, e1):
+            await interaction.response.send_message(
+                "❌ The end point is before the start point.", ephemeral=True)
+            return
+        self.answer = ((s1, e1), (s2, e2))
+        await interaction.response.defer()
+        self.stop()
+
+
 async def ask_quality_in_channel(ctx):
     view = QualityView(ctx.author.id)
     msg = await ctx.send("🎚️ **Quality?**", view=view)
@@ -1263,6 +1421,34 @@ async def ask_yesno_in_channel(ctx, text):
     except Exception:
         pass
     return bool(view.answer)
+
+
+async def ask_series_range_in_channel(ctx, seasons):
+    """
+    Dropdown range picker (start point → end point). Returns
+    (selection, need_text): selection is None with need_text True when the
+    catalog is too big for Discord selects (>25 options), None with
+    need_text False when the user timed out / cancelled, otherwise the
+    parsed episode list.
+    """
+    if len(seasons) > 25 or any(c > 25 for c in seasons.values()):
+        return None, True
+
+    view = SeasonEpisodeRangeView(ctx.author.id, seasons)
+    msg = await ctx.send(
+        "🎯 **Pick the range to download.** Choose the *start* point "
+        "(season + episode), then the *end* point — everything in between "
+        "will be downloaded.",
+        view=view)
+    await view.wait()
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    if view.answer is None:
+        return None, False
+    return make_range_selection(view.answer[0], view.answer[1], seasons), False
 
 
 # =============================================================
@@ -1875,24 +2061,30 @@ async def dl(ctx, *, query: str):
             lines.append(f"• Season {sn}: {seasons[sn]} episodes")
         await ctx.send("\n".join(lines))
 
-        await ctx.send(
-            "🎯 **Which episodes?** Reply with one of:\n"
-            "`all` = everything\n"
-            "`2` = only season 2\n"
-            "`1 3` = seasons 1 and 3\n"
-            "`1-2` = seasons 1 through 2\n"
-            "`2:3-5` = season 2, episodes 3 to 5\n"
-            "`2:1,3` = season 2, episodes 1 and 3"
-        )
-        try:
-            m = await bot.wait_for("message", check=check, timeout=120)
-        except asyncio.TimeoutError:
-            await ctx.send("⏰ Timed out.")
-            return
+        selection, need_text = await ask_series_range_in_channel(ctx, seasons)
+        if need_text:
+            # Fallback for huge catalogs (>25 options per dropdown)
+            await ctx.send(
+                "🎯 **Which episodes?** Reply with one of:\n"
+                "`all` = everything\n"
+                "`2` = only season 2\n"
+                "`1 3` = seasons 1 and 3\n"
+                "`1-2` = seasons 1 through 2\n"
+                "`2:3-5` = season 2, episodes 3 to 5\n"
+                "`2:1,3` = season 2, episodes 1 and 3"
+            )
+            try:
+                m = await bot.wait_for("message", check=check, timeout=120)
+            except asyncio.TimeoutError:
+                await ctx.send("⏰ Timed out.")
+                return
 
-        selection = parse_selection(m.content, seasons)
-        if not selection:
-            await ctx.send("❌ Could not parse selection. Aborting.")
+            selection = parse_selection(m.content, seasons)
+            if not selection:
+                await ctx.send("❌ Could not parse selection. Aborting.")
+                return
+        elif not selection:
+            await ctx.send("❌ No range selected. Aborting.")
             return
 
         await ctx.send(f"▶️ {len(selection)} episodes selected.")
