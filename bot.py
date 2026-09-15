@@ -53,13 +53,12 @@ YTDLP_MODULE = "yt_dlp"
 
 # Torrent indexers (first working mirror in each list is used)
 YTS_API_BASES = [
-    "https://yts.mx/api/v2",
     "https://yts.gg/api/v2",
     "https://movies-api.accel.li/api/v2",
 ]
 EZTV_API_BASES = [
-    "https://eztv.re",
     "https://eztvx.to",
+    "https://eztv.re",
     "https://eztv.ag",
 ]
 
