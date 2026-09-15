@@ -51,10 +51,6 @@ TEMP_FOLDER        = "tmp"                     # yt-dlp temp dir for fragments
 
 YTDLP_MODULE = "yt_dlp"
 
-# Referer header sent for m3u8 streams. VidCore requires this one; change it
-# (or leave empty) for other stream sources.
-M3U8_REFERER = "https://vidcore.io/"
-
 # OpenSubtitles API (free account at opensubtitles.com) — loaded from CREDENTIALS_FILE
 OS_API_KEY   = ""
 OS_USERNAME  = ""
@@ -832,6 +828,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
     yt_cmd = [
         PYTHON_PATH, "-m", YTDLP_MODULE,
+        "--referer", "https://vidcore.io/",
         "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
         "--fragment-retries", "10",
         "--retry-sleep", "2",
@@ -840,10 +837,6 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         "--paths", f"temp:{temp_dir}",             # fragments go here
         m3u8_url,
     ]
-
-    if M3U8_REFERER:
-        yt_cmd.insert(2, "--referer")
-        yt_cmd.insert(3, M3U8_REFERER)
 
     if progress.additional_choice == "1":
         yt_cmd += ["-f", fmt.replace("+bestaudio", "")]
