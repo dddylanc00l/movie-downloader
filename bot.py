@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-VidCore Discord Downloader — Raspberry Pi edition
+Torrent Discord Downloader — Raspberry Pi edition
 - In-channel dropdown/button prompts (restricted to the requester)
 - One editable status message per episode; live progress via !status
+- Movies come from YTS (magnet links), TV episodes from EZTV (magnet links)
+- Downloads via aria2c (BitTorrent); no browser/clipboard tricks needed
+- Subtitles fetched from OpenSubtitles.com (free account required)
 - Auto-upscale to 4K; deletes the non-4K source afterwards
 - Cancel deletes partial downloads completely
 - DMs the user ONLY when the job finishes
 - Auto-resumes interrupted downloads ONCE per process
-- Manual override: !dlurl <m3u8_url> [title]
+- Manual override: !dlurl <magnet|m3u8_url> [title]
 - MP4 output (seekable) for maximum player compatibility
 """
 
 import subprocess
 import time
-import pyperclip
 import os
 import sys
 import re
+import io
 import json
 import pickle
 import asyncio
@@ -39,15 +42,45 @@ ALLOWED_USER_ID = 0
 
 PYTHON_PATH      = sys.executable
 MOVIES_FOLDER    = "/mnt/minecraft-backups/videos"
-CHROME_PATH      = "/usr/bin/chromium"
-CHROME_USER_DATA = "/home/grap/.config/chromium"
+ARIA2C_PATH      = "aria2c"                      # BitTorrent client
 
 PROGRESS_FILE      = "download_progress.pkl"
 STATE_FILE         = "bot_state.json"
 MOVIE_STATE_FILE   = "movie_downloads.pkl"   # tracks in-flight movie downloads
-TEMP_FOLDER        = "tmp"                     # yt-dlp temp dir for fragments
+TEMP_FOLDER        = "tmp"                     # aria2c staging dir for downloads
 
 YTDLP_MODULE = "yt_dlp"
+
+# Torrent indexers (first working mirror in each list is used)
+YTS_API_BASES = [
+    "https://yts.mx/api/v2",
+    "https://yts.gg/api/v2",
+    "https://movies-api.accel.li/api/v2",
+]
+EZTV_API_BASES = [
+    "https://eztv.re",
+    "https://eztvx.to",
+    "https://eztv.ag",
+]
+
+# Public trackers appended to magnets we build ourselves
+PUBLIC_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://exodus.desync.com:6969",
+    "udp://tracker.torrent.eu.org:451",
+]
+
+# Legacy m3u8 streams (via !dlurl). Leave empty to send no Referer header.
+M3U8_REFERER = ""
+
+# OpenSubtitles API (free account at opensubtitles.com)
+OS_API_KEY   = ""
+OS_USERNAME  = ""
+OS_PASSWORD  = ""
+OS_API_BASE  = "https://api.opensubtitles.com/api/v1"
 
 # Tunables
 CONCURRENT_FRAGMENTS = 5
@@ -70,13 +103,6 @@ HEADERS = {
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
-
-
-def kill_chrome():
-    try:
-        subprocess.run(["pkill", "-f", "chromium"], capture_output=True)
-    except Exception:
-        pass
 
 
 def safe_delete(path):
@@ -506,12 +532,152 @@ def get_series_info(imdb_id):
 
 
 # =============================================================
-# Download helpers
+# Torrent indexers (YTS for movies, EZTV for TV)
 # =============================================================
-def construct_vidcore_url(imdb_id, is_series=False, season=1, episode=1):
-    if is_series:
-        return f"https://vidcore.io/tv/{imdb_id}/{season}/{episode}"
-    return f"https://vidcore.io/movie/{imdb_id}"
+def magnet_from_hash(infohash, name=""):
+    magnet = f"magnet:?xt=urn:btih:{infohash}"
+    if name:
+        magnet += "&dn=" + requests.utils.quote(name)
+    for tr in PUBLIC_TRACKERS:
+        magnet += "&tr=" + requests.utils.quote(tr)
+    return magnet
+
+
+def parse_resolution(text):
+    m = re.search(r'(2160p|2160i|1080p|1080i|720p|720i|480p|576p|400p|360p)',
+                  str(text), re.I)
+    if m:
+        return int("".join(ch for ch in m.group(1) if ch.isdigit()))
+    return 0
+
+
+def human_size(num_bytes):
+    num = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if num < 1024:
+            return f"{num:.0f}{unit}" if unit == "B" else f"{num:.1f}{unit}"
+        num /= 1024
+    return f"{num:.1f}PB"
+
+
+def _api_get_json(bases, path, params=None):
+    for base in bases:
+        url = f"{base.rstrip('/')}/{path}"
+        try:
+            r = requests.get(url, headers=HEADERS, params=params or {}, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") in (None, "ok"):
+                return data
+            print(f"[api] {base}: status not ok: {data.get('status_message')}")
+        except Exception as e:
+            print(f"[api] {base}: {e}")
+    return None
+
+
+def search_yts(imdb_id, query=None):
+    """
+    Look up a movie on YTS by IMDb ID and return its torrents
+    ({hash, quality, resolution, size_bytes, seeds, type, title}[]).
+    """
+    torrents = []
+    movies = []
+    data = _api_get_json(YTS_API_BASES, "movie_details.json", {"imdb_id": imdb_id})
+    if data and data.get("data", {}).get("movie"):
+        movies = [data["data"]["movie"]]
+    if not movies:
+        data = _api_get_json(YTS_API_BASES, "list_movies.json",
+                             {"query_term": query or imdb_id, "limit": 50})
+        movies = (data or {}).get("data", {}).get("movies", []) or []
+    for m in movies:
+        for t in m.get("torrents", []):
+            h = t.get("hash")
+            if not h:
+                continue
+            quality = (t.get("quality") or "").lower()   # 720p / 1080p / 2160p / 3d
+            torrents.append({
+                "hash": h,
+                "quality": quality.replace("3d", "1080p"),
+                "resolution": parse_resolution(quality),
+                "size_bytes": t.get("size_bytes") or 0,
+                "seeds": t.get("seeds") or 0,
+                "peers": t.get("peers") or 0,
+                "type": t.get("type") or "",
+                "title": m.get("title_long") or m.get("title") or "",
+            })
+    return torrents
+
+
+def search_eztv(imdb_id, season, episode):
+    """
+    Look up an episode's torrents on EZTV by IMDb ID. Returns entries
+    with magnet_url, resolution, size_bytes, seeds.
+    """
+    digits = re.sub(r'^tt', '', str(imdb_id or ""))
+    data = _api_get_json(EZTV_API_BASES, "api/get-torrents",
+                         {"imdb_id": digits, "limit": 100})
+    if not data:
+        return []
+    entries = []
+    for t in data.get("torrents", []):
+        try:
+            s = int(t.get("season"))
+            e = int(t.get("episode"))
+        except (TypeError, ValueError):
+            continue
+        if s != season or e != episode:
+            continue
+        title = t.get("title") or t.get("filename") or ""
+        entries.append({
+            "hash": (t.get("hash") or "").lower(),
+            "magnet_url": t.get("magnet_url") or "",
+            "title": title,
+            "resolution": parse_resolution(title),
+            "size_bytes": int(t.get("size_bytes") or 0),
+            "seeds": t.get("seeds") or 0,
+            "peers": t.get("peers") or 0,
+        })
+    return entries
+
+
+def torrent_magnet(t):
+    if t.get("magnet_url"):
+        return t["magnet_url"]
+    return magnet_from_hash(t["hash"], t.get("title") or "")
+
+
+def pick_torrent(torrents, quality_choice):
+    """
+    Pick the best torrent for a quality choice. Returns a torrent dict or None.
+    "1"=best available, "2"=2160p (falls back to 1080p), "3"=1080p,
+    "4"=720p, "5"=480p. Prefers seeded torrents when available.
+    """
+    if not torrents:
+        return None
+    targets = {
+        "1": [2160, 1080, 720, 480],
+        "2": [2160, 1080],
+        "3": [1080, 720],
+        "4": [720, 480],
+        "5": [480],
+    }
+    wanted = targets.get(str(quality_choice), [1080, 720, 480])
+
+    candidates = [t for t in torrents if t.get("resolution")]
+    if not candidates:
+        candidates = list(torrents)
+    seeded = [t for t in candidates if (t.get("seeds") or 0) > 0]
+    pool = seeded or candidates
+
+    for res in wanted:
+        group = [t for t in pool if t.get("resolution") == res]
+        if not group:
+            continue
+        group.sort(key=lambda t: (t.get("seeds") or 0), reverse=True)
+        return group[0]
+
+    pool.sort(key=lambda t: (t.get("seeds") or 0), reverse=True)
+    return pool[0] if pool else None
 
 
 def check_internet():
@@ -652,6 +818,27 @@ def find_subtitle_file(base_name):
     return None
 
 
+VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v", ".mov", ".flv")
+
+
+def find_torrent_output(work_dir):
+    """Return the largest finished video file inside an aria2c staging dir."""
+    best = None
+    for root, dirs, files in os.walk(work_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for f in files:
+            if f.endswith((".aria2", ".torrent")):
+                continue
+            if not f.lower().endswith(VIDEO_EXTS):
+                continue
+            path = os.path.join(root, f)
+            if os.path.exists(path + ".aria2"):
+                continue   # transfer still incomplete
+            if best is None or os.path.getsize(path) > os.path.getsize(best):
+                best = path
+    return best
+
+
 def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
     """
     Make a downloaded MP4 seekable/skippable by writing the moov atom to the
@@ -790,7 +977,6 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
     yt_cmd = [
         PYTHON_PATH, "-m", YTDLP_MODULE,
-        "--referer", "https://vidcore.io/",
         "--concurrent-fragments", str(CONCURRENT_FRAGMENTS),
         "--fragment-retries", "10",
         "--retry-sleep", "2",
@@ -799,6 +985,10 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         "--paths", f"temp:{temp_dir}",             # fragments go here
         m3u8_url,
     ]
+
+    if M3U8_REFERER:
+        yt_cmd.insert(2, "--referer")
+        yt_cmd.insert(3, M3U8_REFERER)
 
     if progress.additional_choice == "1":
         yt_cmd += ["-f", fmt.replace("+bestaudio", "")]
@@ -918,11 +1108,11 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
 
 # =============================================================
-# Chrome + clipboard downloader
+# Torrent downloader (aria2c)
 # =============================================================
-def download_one(url, title, episode_info, progress, notify, loop, channel,
-                 job_id, cancel_event,
-                 is_movie=False, retry=0):
+def download_magnet(magnet, title, episode_info, progress, notify, loop, channel,
+                    job_id, cancel_event,
+                    is_movie=False, retry=0):
 
     def cancelled():
         return cancel_event is not None and cancel_event.is_set()
@@ -955,7 +1145,7 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
                 print(f"[status edit] {e}")
         asyncio.run_coroutine_threadsafe(_edit(), loop)
 
-    set_status("starting…", force=True)
+    set_status("starting torrent download…", force=True)
 
     if cancelled():
         set_status("🛑 cancelled before start", force=True)
@@ -973,91 +1163,353 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
             set_status("❌ still offline, skipping", force=True)
             return False
 
-    kill_chrome()
-    time.sleep(2)
+    # Build the output base name — torrents keep their own filename inside a
+    # staging dir and we rename on success (keeps the old naming scheme).
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if title:
+        safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
+        if episode_info:
+            base_name = (f"{safe}_S{episode_info['season']:02d}"
+                         f"E{episode_info['episode']:02d}_Q{progress.quality_choice}")
+        else:
+            base_name = f"{safe}_{ts}_Q{progress.quality_choice}"
+    else:
+        base_name = f"video_{ts}"
 
-    try:
-        chrome_process = subprocess.Popen([
-            CHROME_PATH,
-            f"--user-data-dir={CHROME_USER_DATA}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=CalculateNativeWinOcclusion",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-session-crashed-bubble",
-            "--hide-crash-restore-bubble",
-            url
-        ])
-    except FileNotFoundError:
-        set_status(f"❌ Chromium not found at {CHROME_PATH}", force=True)
-        return False
+    if episode_info:
+        out_dir = os.path.join(
+            MOVIES_FOLDER, safe, f"Season_{episode_info['season']}")
+        os.makedirs(out_dir, exist_ok=True)
+    else:
+        out_dir = MOVIES_FOLDER
 
-    m3u8_url = None
-    last_clip = ""
-    max_wait = 120
-    for attempt in range(max_wait):
-        if cancelled():
-            try: chrome_process.terminate()
-            except Exception: pass
-            kill_chrome()
-            set_status("🛑 cancelled while waiting for URL", force=True)
-            return False
-        try:
-            clip = pyperclip.paste()
-        except Exception:
-            clip = ""
-        if clip and clip != last_clip and ".m3u8" in clip and clip.startswith("http"):
-            m3u8_url = clip
-            break
-        last_clip = clip
-        set_status(f"waiting for m3u8 URL… ({attempt}s)")
-        time.sleep(1)
-
-    try:
-        chrome_process.terminate()
-        time.sleep(1)
-        kill_chrome()
-    except Exception:
-        pass
-
-    if not m3u8_url:
-        if retry < max_retries:
-            set_status(f"retrying… ({retry+1}/{max_retries})", force=True)
-            time.sleep(3)
-            return download_one(url, title, episode_info, progress,
-                                notify, loop, channel, job_id, cancel_event,
-                                is_movie, retry + 1)
-        if is_movie and "movie" in url:
-            imdb_id = url.split("/movie/")[-1]
-            series_url = f"https://vidcore.io/tv/{imdb_id}/1/1"
-            set_status("trying series URL…", force=True)
-            return download_one(series_url, title,
-                                {"season": 1, "episode": 1},
-                                progress, notify, loop, channel,
-                                job_id, cancel_event, False, 0)
-        set_status("❌ could not capture m3u8 URL", force=True)
-        return False
-
-    return _ytdlp_run(
-        m3u8_url, title, episode_info, progress,
-        status_msg=status_msg, set_status=set_status,
-        notify=notify, loop=loop, channel=channel,
-        job_id=job_id, cancel_event=cancel_event,
-        max_retries=max_retries, retry=retry,
-        retry_fn=lambda r: download_one(url, title, episode_info, progress,
-                                        notify, loop, channel, job_id,
-                                        cancel_event, is_movie, r)
+    # Persist the magnet so an interrupted job can be resumed after restart
+    MovieDownloadsState.load().add(
+        base_name, magnet, title or "manual",
+        progress.quality_choice, progress.additional_choice
     )
 
+    work_dir = os.path.join(MOVIES_FOLDER, TEMP_FOLDER, base_name)
+    safe_delete(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+
+    args = [
+        ARIA2C_PATH,
+        "--dir", work_dir,
+        "--seed-time", "0",
+        "--bt-stop-timeout", "90",
+        "--summary-interval", "5",
+        "--continue", "true",
+        "--auto-file-renaming", "false",
+        "--allow-overwrite", "true",
+        "--file-allocation", "none",
+        "--max-connection-per-server", "16",
+        "--split", "4",
+        "-k", "1M",
+        "--console-log-level", "warn",
+        magnet,
+    ]
+
+    try:
+        process = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, bufsize=1)
+    except Exception as e:
+        set_status(f"❌ aria2c failed to start: {e}", force=True)
+        return False
+
+    q = queue.Queue()
+    def reader(stream):
+        for line in iter(stream.readline, ''):
+            if line: q.put(line.rstrip())
+        stream.close()
+    threading.Thread(target=reader, args=(process.stdout,), daemon=True).start()
+    threading.Thread(target=reader, args=(process.stderr,), daemon=True).start()
+
+    while process.poll() is None or not q.empty():
+        if cancelled():
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            break
+        try:
+            line = q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        # aria2c summary lines: [ #abc 1.2GiB/3.0GiB(40%) CN:3 DL:5MiB ... ]
+        if line.startswith("[") and ("CN:" in line or "DL:" in line):
+            status = line.split("]", 1)[0] if "]" in line else line[:120]
+            text = status[1:].strip()
+            if text:
+                set_status(f"⬇️ {text}")
+                set_live_status(job_id, f"⬇️ {text}")
+        elif "Download Results:" in line:
+            set_live_status(job_id, "processing download…")
+
+    if cancelled():
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
+        cleanup_download_artifacts(base_name)
+        safe_delete(work_dir)
+        set_status("🛑 cancelled — files deleted", force=True)
+        set_live_status(job_id, "🛑 cancelled")
+        return False
+
+    source = find_torrent_output(work_dir)
+    if not source:
+        if retry < max_retries:
+            set_status(f"no usable video downloaded, retrying… ({retry+1}/{max_retries})",
+                       force=True)
+            time.sleep(3)
+            return download_magnet(magnet, title, episode_info, progress,
+                                   notify, loop, channel, job_id, cancel_event,
+                                   is_movie, retry + 1)
+        set_status("❌ aria2c finished but no video file found", force=True)
+        return False
+
+    # Move the finished file into place under the desired base name
+    ext = os.path.splitext(source)[1]
+    final_path = os.path.join(out_dir, base_name + ext)
+    try:
+        shutil.move(source, final_path)
+    except Exception as e:
+        print(f"[torrent move] {e}")
+        try:
+            shutil.copy2(source, final_path)
+            safe_delete(source)
+        except Exception as e2:
+            set_status(f"❌ could not move downloaded file: {e2}", force=True)
+            return False
+    safe_delete(work_dir)
+
+    set_status(f"✅ downloaded: {base_name}{ext}", force=True)
+
+    want_upscale = progress.upscale and progress.additional_choice != "2" \
+        and progress.quality_choice in ("1", "2", "3")
+
+    # Name subtitles to match the final file (upscaled output keeps the _4k tag)
+    sub_base = f"{base_name}_4k" if want_upscale else base_name
+    if progress.subtitles:
+        fetch_subtitles(progress.imdb_id, title, episode_info, sub_base, out_dir,
+                        post=lambda m: _upscale_post(loop, channel, m))
+
+    # Remove from persisted state — the work is done
+    MovieDownloadsState.load().remove(base_name)
+
+    if want_upscale:
+        # Hand the file to the background upscale worker so the next
+        # download can start immediately while ffmpeg encodes this one.
+        enqueue_upscale(final_path, job_id=job_id, label=base_name,
+                        cancel_event=cancel_event,
+                        loop=loop, channel=channel,
+                        set_status=set_status)
+    else:
+        # Non-upscaled video files get a faststart remux so they are
+        # seekable/skippable and get checked for encoding glitches.
+        result = verify_and_faststart(final_path,
+                                      status_cb=lambda m: set_status(m, force=True),
+                                      cancel_event=cancel_event)
+        if not result:
+            if cancelled():
+                set_status("🛑 cancelled during post-processing", force=True)
+                safe_delete(final_path)
+                return False
+            set_status("❌ glitch/corruption detected — will retry later", force=True)
+            return False
+
+    set_status("✅ done", force=True)
+    return True
+
 
 # =============================================================
-# Direct-URL downloader (also persists URL for resume)
+# Subtitle downloader (OpenSubtitles REST API)
 # =============================================================
-def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
+_OS_TOKEN = {"token": None}
+
+
+def os_login():
+    if not OS_API_KEY or not OS_USERNAME or not OS_PASSWORD:
+        return None
+    if _OS_TOKEN.get("token"):
+        return _OS_TOKEN["token"]
+    try:
+        r = requests.post(
+            f"{OS_API_BASE}/login",
+            headers={"Api-Key": OS_API_KEY,
+                     "User-Agent": "MovieDownloaderBot/1.0",
+                     "Content-Type": "application/json"},
+            json={"username": OS_USERNAME, "password": OS_PASSWORD},
+            timeout=15)
+        r.raise_for_status()
+        token = r.json().get("token")
+        _OS_TOKEN["token"] = token
+        return token
+    except Exception as e:
+        print(f"[opensubtitles login] {e}")
+        return None
+
+
+def os_search(imdb_id, episode_info=None):
+    token = os_login()
+    if not token:
+        return None
+    params = {"imdb_id": str(imdb_id)}
+    if episode_info:
+        params["season_number"] = str(episode_info.get("season"))
+        params["episode_number"] = str(episode_info.get("episode"))
+        params["type"] = "episode"
+    else:
+        params["type"] = "movie"
+    langs = []
+    for part in str(SUBTITLE_LANGS).split(","):
+        code = part.strip().split("*")[0].strip()
+        if code and code not in langs:
+            langs.append(code)
+    if langs:
+        params["languages"] = ",".join(langs)
+    try:
+        r = requests.get(
+            f"{OS_API_BASE}/subtitles",
+            headers={"Api-Key": OS_API_KEY,
+                     "Authorization": f"Bearer {token}",
+                     "User-Agent": "MovieDownloaderBot/1.0"},
+            params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[opensubtitles search] {e}")
+        return None
+
+
+def os_download(file_id):
+    token = os_login()
+    if not token:
+        return None
+    try:
+        r = requests.post(
+            f"{OS_API_BASE}/download",
+            headers={"Api-Key": OS_API_KEY,
+                     "Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json",
+                     "User-Agent": "MovieDownloaderBot/1.0"},
+            json={"file_id": file_id}, timeout=20)
+        r.raise_for_status()
+        link = r.json().get("link")
+        if not link:
+            return None
+        rr = requests.get(link, headers={"User-Agent": "MovieDownloaderBot/1.0"},
+                          timeout=30)
+        rr.raise_for_status()
+        return rr.content
+    except Exception as e:
+        print(f"[opensubtitles download] {e}")
+        return None
+
+
+def fetch_subtitles(imdb_id, title, episode_info, base_name, out_dir, post=None):
+    """
+    Download the best matching subtitle (from SUBTITLE_LANGS) for the given
+    imdb_id / episode and save it next to the video as <base_name>.<lang>.<ext>.
+    """
+    def post_msg(text):
+        try:
+            if post:
+                post(text)
+            else:
+                print(text)
+        except Exception as e:
+            print(f"[subtitle post] {e}")
+
+    if not imdb_id or str(imdb_id).lower() == "manual":
+        return
+    if not OS_API_KEY:
+        post_msg(f"⚠️ OpenSubtitles not configured — subtitle skipped for `{base_name}`")
+        return
+
+    # Skip if a subtitle already exists alongside this file
+    try:
+        for f in os.listdir(out_dir):
+            if f.startswith(base_name) and \
+                    f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
+                return
+    except OSError:
+        pass
+
+    data = os_search(imdb_id, episode_info)
+    if not data or not data.get("data"):
+        post_msg(f"⚠️ No subtitle found on OpenSubtitles for `{title}`.")
+        return
+
+    langs = [p.strip().split("*")[0].strip().lower()
+             for p in str(SUBTITLE_LANGS).split(",") if p.strip()]
+    chosen = None
+    for lang in langs:
+        for item in data.get("data", []):
+            attrs = item.get("attributes", {}) or {}
+            files = attrs.get("files") or []
+            item_lang = (attrs.get("language") or "").lower()
+            if not files or not item_lang.startswith(lang):
+                continue
+            chosen = (files[0].get("file_id"), lang)
+            break
+        if chosen:
+            break
+
+    if not chosen:
+        post_msg(f"⚠️ No subtitle in requested languages for `{title}` on OpenSubtitles.")
+        return
+
+    file_id, lang = chosen
+    content = os_download(file_id)
+    if content is None:
+        post_msg(f"⚠️ Subtitle download failed for `{base_name}`.")
+        return
+
+    # Unpack if OpenSubtitles returned a zip (multi-file subtitle)
+    ext = ".srt"
+    if content[:2] == b"PK":
+        import zipfile
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                names = [n for n in z.namelist()
+                         if n.lower().endswith((".srt", ".vtt", ".ass", ".ssa"))]
+                if names:
+                    names.sort()
+                    content = z.read(names[0])
+                    ext = os.path.splitext(names[0])[1].lower()
+        except Exception as e:
+            print(f"[subtitle unzip] {e}")
+
+    sub_path = os.path.join(out_dir, f"{base_name}.{lang}{ext}")
+    try:
+        with open(sub_path, "wb") as f:
+            f.write(content)
+        post_msg(f"💬 Subtitle saved: {os.path.basename(sub_path)}")
+    except Exception as e:
+        print(f"[subtitle save] {e}")
+
+
+# =============================================================
+# Direct-URL downloader (magnet / torrent / m3u8; persists URL for resume)
+# =============================================================
+def download_from_url(url, title, episode_info, progress, notify, loop, channel,
                       job_id, cancel_event,
                       is_movie=True, retry=0):
+    if url.startswith("magnet:") or (url.startswith("http") and ".m3u8" not in url):
+        return download_magnet(url, title, episode_info, progress, notify, loop,
+                               channel, job_id, cancel_event, is_movie, retry)
+    return _download_m3u8_url(url, title, episode_info, progress, notify, loop,
+                              channel, job_id, cancel_event, is_movie, retry)
+
+
+def _download_m3u8_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
+                       job_id, cancel_event,
+                       is_movie=True, retry=0):
 
     max_retries = 3
 
@@ -1231,7 +1683,6 @@ class QualitySelect(discord.ui.Select):
                 discord.SelectOption(label="1080p", value="3"),
                 discord.SelectOption(label="720p", value="4"),
                 discord.SelectOption(label="480p", value="5"),
-                discord.SelectOption(label="Audio only", value="6"),
             ],
         )
 
@@ -1245,29 +1696,6 @@ class QualityView(OwnerRestrictedView):
     def __init__(self, owner_id):
         super().__init__(owner_id)
         self.add_item(QualitySelect())
-
-
-class ModeSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(
-            placeholder="Video / audio / both?",
-            options=[
-                discord.SelectOption(label="Video + audio (default)", value="3"),
-                discord.SelectOption(label="Video only", value="1"),
-                discord.SelectOption(label="Audio only", value="2"),
-            ],
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view.answer = self.values[0]
-        await interaction.response.defer()
-        self.view.stop()
-
-
-class ModeView(OwnerRestrictedView):
-    def __init__(self, owner_id):
-        super().__init__(owner_id)
-        self.add_item(ModeSelect())
 
 
 class YesNoView(OwnerRestrictedView):
@@ -1402,14 +1830,7 @@ async def ask_quality_in_channel(ctx):
 
 
 async def ask_mode_in_channel(ctx):
-    view = ModeView(ctx.author.id)
-    msg = await ctx.send("📼 **Download mode?**", view=view)
-    await view.wait()
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-    return view.answer or "3"
+    return "3"   # torrents always combine video + audio; no choice needed
 
 
 async def ask_yesno_in_channel(ctx, text):
@@ -1512,19 +1933,28 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
             await ctx.send(f"⏭️ S{season:02d}E{episode:02d} already downloaded, skipping")
             continue
 
-        url = construct_vidcore_url(imdb_id, True, season, episode)
         ep_info = {"season": season, "episode": episode}
 
-        ok = await asyncio.to_thread(
-            download_one,
-            url, title, ep_info, progress,
-            lambda m: notify(ctx.channel, m),
-            loop,
-            ctx.channel,
-            job_id,
-            cancel_event,
-            False, 0
-        )
+        torrents = await asyncio.to_thread(search_eztv, imdb_id, season, episode)
+        chosen = pick_torrent(torrents, progress.quality_choice)
+        ok = False
+        if chosen is None:
+            await ctx.send(
+                f"⚠️ No EZTV torrent found for **{title}** "
+                f"S{season:02d}E{episode:02d}"
+            )
+        else:
+            magnet = torrent_magnet(chosen)
+            ok = await asyncio.to_thread(
+                download_magnet,
+                magnet, title, ep_info, progress,
+                lambda m: notify(ctx.channel, m),
+                loop,
+                ctx.channel,
+                job_id,
+                cancel_event,
+                False, 0
+            )
 
         if ok:
             progress.downloaded_episodes += 1
@@ -1561,7 +1991,7 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
         failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
         await ctx.send(
             f"⚠️ **{title}** — done with failures: {failed}\n"
-            f"💡 Use `!dlurl <m3u8_url> <title>` to supply a manual source for a failed episode."
+            f"💡 Use `!dlurl <magnet|m3u8_url> <title>` to supply a manual source for a failed episode."
         )
 
     try:
@@ -1605,18 +2035,31 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
 
     loop = asyncio.get_running_loop()
-    url = construct_vidcore_url(imdb_id, False)
-
-    ok = await asyncio.to_thread(
-        download_one,
-        url, title, None, progress,
-        lambda m: notify(ctx.channel, m),
-        loop,
-        ctx.channel,
-        job_id,
-        cancel_event,
-        True, 0
-    )
+    torrents = await asyncio.to_thread(search_yts, imdb_id, title)
+    chosen = pick_torrent(torrents, progress.quality_choice)
+    ok = False
+    if chosen is None:
+        await ctx.send(f"⚠️ No YTS torrent found for **{title}**.")
+    else:
+        if progress.quality_choice in ("2",):
+            await ctx.send(
+                f"ℹ️ Forcing 4K quality — **{title}** will be the largest "
+                f"2160p torrent available on YTS."
+            )
+        magnet = torrent_magnet(chosen)
+        await ctx.send(f"🎬 Torrent picked: **{chosen['title']}** "
+                       f"({chosen['quality']}, {human_size(chosen.get('size_bytes') or 0)}, "
+                       f"🌱{chosen.get('seeds') or 0})")
+        ok = await asyncio.to_thread(
+            download_magnet,
+            magnet, title, None, progress,
+            lambda m: notify(ctx.channel, m),
+            loop,
+            ctx.channel,
+            job_id,
+            cancel_event,
+            True, 0
+        )
 
     if cancel_event.is_set():
         return
@@ -2108,19 +2551,23 @@ async def dlurl(ctx, url: str, *, title: str = None):
 
     ensure_queue_worker()
 
-    if ".m3u8" not in url or not url.startswith("http"):
-        await ctx.send("❌ That doesn't look like an m3u8 URL.")
+    if url.startswith("magnet:"):
+        pass
+    elif url.startswith("http") and ".m3u8" in url:
+        pass
+    else:
+        await ctx.send("❌ That doesn't look like a magnet or http(s) URL.")
         return
 
     if not title:
         title = "manual_download"
 
-    await ctx.send(f"📋 Manual URL: `{url[:80]}…`\nTitle: **{title}**")
+    await ctx.send(f"📋 Manual source: `{url[:80]}…`\nTitle: **{title}**")
 
-    quality    = await ask_quality_in_channel(ctx)
-    additional = await ask_mode_in_channel(ctx)
-    subs       = await ask_yesno_in_channel(ctx, "💬 **Download subtitles?**")
-    upscale    = await ask_yesno_in_channel(ctx, "🔼 **Upscale to 4K?**")
+    quality   = await ask_quality_in_channel(ctx)
+    additional = "3"   # torrents are always video+audio
+    subs      = await ask_yesno_in_channel(ctx, "💬 **Download subtitles?**")
+    upscale   = await ask_yesno_in_channel(ctx, "🔼 **Upscale to 4K?**")
 
     options = {
         "quality": quality,
