@@ -36,7 +36,7 @@ from discord.ext import commands
 # =============================================================
 # CONFIG — Raspberry Pi
 # =============================================================
-DISCORD_TOKEN   = "PASTE_YOUR_BOT_TOKEN_HERE"
+DISCORD_TOKEN   = ""          # loaded from CREDENTIALS_FILE at startup
 ALLOWED_USER_ID = 0
 
 PYTHON_PATH      = sys.executable
@@ -55,11 +55,15 @@ YTDLP_MODULE = "yt_dlp"
 # (or leave empty) for other stream sources.
 M3U8_REFERER = "https://vidcore.io/"
 
-# OpenSubtitles API (free account at opensubtitles.com)
+# OpenSubtitles API (free account at opensubtitles.com) — loaded from CREDENTIALS_FILE
 OS_API_KEY   = ""
 OS_USERNAME  = ""
 OS_PASSWORD  = ""
 OS_API_BASE  = "https://api.opensubtitles.com/api/v1"
+
+# Secrets live in a separate text file (not hard-coded in this script).
+# Format, one per line:  KEY = value   (# lines and blanks are ignored)
+CREDENTIALS_FILE = "credentials.txt"
 
 # Tunables
 CONCURRENT_FRAGMENTS = 5
@@ -69,6 +73,32 @@ SUBTITLE_LANGS = "en.*,nl.*"   # subtitle languages to fetch (en = English, nl =
 # =============================================================
 # Setup
 # =============================================================
+def load_credentials(path=CREDENTIALS_FILE):
+    """
+    Read secrets from a KEY = value text file and update the module-level
+    DISCORD_TOKEN / OS_* variables. Returns True if a Discord token was found.
+    """
+    global DISCORD_TOKEN, OS_API_KEY, OS_USERNAME, OS_PASSWORD
+    found = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                found[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError as e:
+        print(f"[credentials] could not read {path}: {e}")
+        return False
+
+    DISCORD_TOKEN  = found.get("DISCORD_TOKEN", DISCORD_TOKEN)
+    OS_API_KEY     = found.get("OS_API_KEY", OS_API_KEY)
+    OS_USERNAME    = found.get("OS_USERNAME", OS_USERNAME)
+    OS_PASSWORD    = found.get("OS_PASSWORD", OS_PASSWORD)
+    return bool(DISCORD_TOKEN)
+
+
 os.makedirs(MOVIES_FOLDER, exist_ok=True)
 os.makedirs(os.path.join(MOVIES_FOLDER, TEMP_FOLDER), exist_ok=True)
 
@@ -2435,4 +2465,8 @@ async def cancel(ctx, job_id: int = None):
 
 
 if __name__ == "__main__":
+    if not load_credentials():
+        print("❌ No DISCORD_TOKEN found. Fill in the file "
+              f"'{CREDENTIALS_FILE}' and restart.")
+        sys.exit(1)
     bot.run(DISCORD_TOKEN)

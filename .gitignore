@@ -4,3 +4,4 @@ movies/
 *.pkl
 *.part
 *.ytdl
+credentials.txt
