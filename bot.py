@@ -8,7 +8,7 @@ VidCore Discord Downloader — Raspberry Pi edition
 - DMs the user ONLY when the job finishes
 - Auto-resumes interrupted downloads ONCE per process
 - Manual override: !dlurl <http(s)_url> [title]  (m3u8, YouTube, direct links)
-- Subtitles: native stream subs via yt-dlp, OpenSubtitles as fallback
+- Subtitles: fetched from OpenSubtitles after download (never via yt-dlp)
 - MP4 output (seekable) for maximum player compatibility
 """
 
@@ -850,10 +850,6 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         yt_cmd += ["--merge-output-format", "mp4"]
         yt_cmd += ["--remux-video", "mp4"]
 
-    if progress.subtitles:
-        yt_cmd += ["--write-subs", "--write-auto-subs",
-                   "--sub-langs", SUBTITLE_LANGS, "--convert-subs", "srt"]
-
     yt_cmd += ["-o", out_path, "--progress", "--newline"]
 
     try:
@@ -924,13 +920,19 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     want_upscale = progress.upscale and progress.additional_choice != "2" \
         and progress.quality_choice in ("1", "2", "3")
 
-    # Subtitles: native stream subs (via yt-dlp, saved next to the output)
-    # are tried first; if none were saved, fall back to OpenSubtitles. The
-    # OpenSubtitles file is named to match the final (post-upscale) base name.
+    # Subtitles come from OpenSubtitles only — yt-dlp never downloads subs,
+    # so subtitle handling can never break the video download. Fetching runs
+    # in a background thread so a slow OpenSubtitles can't delay completion.
+    # The subtitle is named to match the final video file exactly (minus the
+    # file type) so the TV picks it up automatically. Upscaling renames the
+    # video to <base_name>_4k.ext, so the subtitle is prefixed accordingly.
     if progress.subtitles and not find_subtitle_file(base_name):
         sub_base = f"{base_name}_4k" if want_upscale else base_name
-        fetch_subtitles(progress.imdb_id, title, episode_info, sub_base, out_dir,
-                        post=lambda m: _upscale_post(loop, channel, m))
+        threading.Thread(
+            target=fetch_subtitles,
+            args=(progress.imdb_id, title, episode_info, sub_base, out_dir),
+            kwargs={"post": lambda m: _upscale_post(loop, channel, m)},
+            daemon=True).start()
 
     if want_upscale:
         # Hand the file to the background upscale worker so the next
@@ -1180,7 +1182,8 @@ def os_download(file_id):
 def fetch_subtitles(imdb_id, title, episode_info, base_name, out_dir, post=None):
     """
     Download the best matching subtitle (from SUBTITLE_LANGS) for the given
-    imdb_id / episode and save it next to the video as <base_name>.<lang>.<ext>.
+    imdb_id / episode and save it next to the video as <base_name>.<ext> so it
+    matches the video file name exactly (TV players pick it up automatically).
     """
     def post_msg(text):
         try:
@@ -1230,7 +1233,7 @@ def fetch_subtitles(imdb_id, title, episode_info, base_name, out_dir, post=None)
         post_msg(f"⚠️ No subtitle in requested languages for `{title}` on OpenSubtitles.")
         return
 
-    file_id, lang = chosen
+    file_id, _ = chosen
     content = os_download(file_id)
     if content is None:
         post_msg(f"⚠️ Subtitle download failed for `{base_name}`.")
@@ -1251,7 +1254,7 @@ def fetch_subtitles(imdb_id, title, episode_info, base_name, out_dir, post=None)
         except Exception as e:
             print(f"[subtitle unzip] {e}")
 
-    sub_path = os.path.join(out_dir, f"{base_name}.{lang}{ext}")
+    sub_path = os.path.join(out_dir, f"{base_name}{ext}")
     try:
         with open(sub_path, "wb") as f:
             f.write(content)
