@@ -2,23 +2,16 @@
 """
 VidCore Discord Downloader — Raspberry Pi edition
 
-Fixes in this version:
-- Resume bug: only resumes jobs that were actually interrupted (in_progress=True
-  and completed=False). Completed items are skipped using both the state file
-  AND a disk-completeness check (no .part, no tmp fragments, min size).
-- MP4 verification bug: dropped the aggressive -err_detect explode -xerror
-  which rejected good HLS-sourced files. Faststart failures now keep the
-  original file rather than losing the download.
-
-Features:
-- In-channel dropdown/button prompts (restricted to the requester)
-- One editable status message per episode; live progress via !status
-- Auto-upscale to 4K; deletes the non-4K source afterwards
-- Cancel deletes partial downloads completely
-- DMs the user ONLY when the job finishes
-- Auto-resumes interrupted downloads ONCE per process
-- Manual override: !dlurl <m3u8_url> [title]
-- Credentials loaded from credentials.txt (Discord token + OpenSubtitles key)
+Fixes:
+- Resume bug: on_ready branches on kind (series/movie/movie_url) and only
+  resumes jobs that were actually in_progress. Movies resume via their own
+  handler instead of being misrouted through run_series.
+- MP4 verification: no more aggressive -err_detect explode -xerror. Faststart
+  failures keep the original file rather than losing the download.
+- completed_episodes entries are normalized to tuples so legacy pickles
+  containing ["movie", "movie"] can't crash set operations.
+- .part files may land next to the output; completeness + cleanup scans
+  the whole tree, so their location doesn't matter.
 """
 
 import subprocess
@@ -47,14 +40,8 @@ from discord.ext import commands
 CREDENTIALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "credentials.txt")
 
+
 def load_credentials():
-    """
-    Read credentials.txt. Format:
-        DISCORD_TOKEN=your-token
-        OPENSUBTITLES_API_KEY=your-key
-        # Comments and blank lines are ignored.
-    Returns a dict.
-    """
     creds = {
         "DISCORD_TOKEN": "",
         "OPENSUBTITLES_API_KEY": "",
@@ -78,7 +65,7 @@ def load_credentials():
 CREDS = load_credentials()
 
 # =============================================================
-# CONFIG — Raspberry Pi
+# CONFIG
 # =============================================================
 DISCORD_TOKEN   = CREDS.get("DISCORD_TOKEN", "")
 OPENSUBS_KEY    = CREDS.get("OPENSUBTITLES_API_KEY", "")
@@ -142,6 +129,7 @@ def safe_delete(path):
 
 
 def cleanup_download_artifacts(output_prefix):
+    """Delete every file/folder matching the download prefix, anywhere."""
     try:
         touched_dirs = set()
         for root, dirs, files in os.walk(MOVIES_FOLDER):
@@ -171,7 +159,7 @@ def cleanup_download_artifacts(output_prefix):
 
 
 # =============================================================
-# Disk completeness check
+# Disk completeness + helpers
 # =============================================================
 def find_downloaded_file_anywhere(base_name):
     for root, dirs, files in os.walk(MOVIES_FOLDER):
@@ -186,20 +174,16 @@ def find_downloaded_file_anywhere(base_name):
 
 
 def is_download_complete_on_disk(base_name, min_size_mb=10):
-    """
-    A download is complete only when:
-      - No .part file with this prefix exists anywhere
-      - No tmp fragment dir with this prefix exists
-      - A final video file exists and is above the minimum size
-    """
     min_bytes = min_size_mb * 1024 * 1024
 
+    # Any .part anywhere → not complete
     for root, dirs, files in os.walk(MOVIES_FOLDER):
         dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
         for f in files:
             if f.startswith(base_name) and f.endswith(".part"):
                 return False
 
+    # Any tmp fragment dir for this prefix → not complete
     try:
         for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
             if entry.startswith(base_name):
@@ -225,21 +209,7 @@ def find_subtitle_file(base_name):
     return None
 
 
-def guess_base_name(title, episode_info, quality):
-    """Reconstruct the base name pattern used by _ytdlp_run."""
-    safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "").replace(' ', '_')
-    if episode_info:
-        return (f"{safe}_S{episode_info['season']:02d}"
-                f"E{episode_info['episode']:02d}_Q{quality}")
-    return f"{safe}_Q{quality}"
-
-
 def episode_or_movie_in_disk(title, episode_info, quality):
-    """
-    Check if a specific episode/movie is complete on disk by matching
-    any file whose name starts with the base pattern. We do a prefix
-    search because movies include a timestamp in the name.
-    """
     safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "").replace(' ', '_')
     if episode_info:
         prefix = (f"{safe}_S{episode_info['season']:02d}"
@@ -252,9 +222,7 @@ def episode_or_movie_in_disk(title, episode_info, quality):
         for f in files:
             if not f.startswith(prefix):
                 continue
-            if f.endswith(".part"):
-                continue
-            if "_4k" in f:
+            if f.endswith(".part") or "_4k" in f:
                 continue
             ext = os.path.splitext(f)[1].lower()
             if ext not in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
@@ -269,7 +237,7 @@ def episode_or_movie_in_disk(title, episode_info, quality):
 
 
 # =============================================================
-# Global live status
+# Live status
 # =============================================================
 LIVE_STATUS = {}
 LIVE_STATUS_LOCK = threading.Lock()
@@ -467,6 +435,16 @@ class MovieDownloadsState:
 # =============================================================
 # Progress
 # =============================================================
+def _normalize_ep_list(raw_list):
+    """Convert a list of [s,e] / (s,e) into a list of (s,e) tuples.
+    Silently drops entries that aren't 2-element sequences."""
+    out = []
+    for item in raw_list or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((item[0], item[1]))
+    return out
+
+
 class DownloadProgress:
     def __init__(self):
         self.title = ""
@@ -475,7 +453,7 @@ class DownloadProgress:
         self.total_episodes = 0
         self.downloaded_episodes = 0
         self.completed = False
-        self.in_progress = False           # True only while actively downloading
+        self.in_progress = False
         self.completed_at = None
         self.failed_episodes = []
         self.completed_episodes = []
@@ -519,6 +497,10 @@ class DownloadProgress:
         for name, default in defaults.items():
             if not hasattr(obj, name):
                 setattr(obj, name, default)
+
+        # Normalize episode lists to tuples so set operations never blow up.
+        obj.completed_episodes = _normalize_ep_list(obj.completed_episodes)
+        obj.selected_episodes = _normalize_ep_list(obj.selected_episodes)
         return obj
 
     def percent(self):
@@ -552,7 +534,7 @@ def load_state():
 
 
 # =============================================================
-# IMDb helpers
+# IMDb + TVMaze helpers
 # =============================================================
 def classify(q_value: str, qid: str = "") -> str:
     qid = (qid or "").strip()
@@ -763,14 +745,8 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
 
 def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
     """
-    Make an MP4 seekable via a stream-copy +faststart pass.
-
-    Permissive on purpose: no -err_detect explode, no -xerror. HLS-sourced
-    MP4s routinely have minor timestamp oddities that ffmpeg warns about
-    but which don't affect playback. We only fail on real ffmpeg errors.
-
-    On failure we KEEP the original file and return its path, so a download
-    is never lost just because faststart didn't succeed.
+    Stream-copy +faststart pass. Permissive: no -err_detect explode,
+    no -xerror. On any failure, keep the original and return its path.
     """
     if not os.path.exists(input_file):
         if status_cb: status_cb("❌ File not found for faststart pass.")
@@ -1143,7 +1119,7 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
 
 
 # =============================================================
-# Direct-URL downloader (also persists URL for resume)
+# Direct-URL downloader
 # =============================================================
 def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
                       job_id, cancel_event,
@@ -1210,10 +1186,7 @@ def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, cha
         retry_fn=lambda r: download_from_url(m3u8_url, title, episode_info,
                                              progress, notify, loop, channel,
                                              job_id, cancel_event, is_movie, r)
-    )
-
-
-# =============================================================
+    )# =============================================================
 # Selection parser
 # =============================================================
 def make_range_selection(start, end, seasons):
@@ -1555,7 +1528,7 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
     progress.imdb_id = imdb_id
     progress.kind = "series"
     progress.season_episode_counts = seasons
-    progress.selected_episodes = selection
+    progress.selected_episodes = [(s, e) for s, e in selection]
     progress.total_episodes = len(selection)
     if not progress.start_time:
         progress.start_time = time.time()
@@ -1570,16 +1543,18 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
     progress.completed_at = None
     if not hasattr(progress, "completed_episodes"):
         progress.completed_episodes = []
+    progress.completed_episodes = _normalize_ep_list(progress.completed_episodes)
     progress.save()
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
 
-    completed_set = {(s, e) for s, e in progress.completed_episodes}
-    remaining = [ep for ep in selection if ep not in completed_set]
+    completed_set = set(progress.completed_episodes)  # already tuples
+    selection_t = [(s, e) for s, e in selection]
+    remaining = [ep for ep in selection_t if ep not in completed_set]
 
     await ctx.send(
         f"▶️ Starting **{title}** — {len(selection)} episodes in selection, "
-        f"{len(completed_set & set(selection))} already done, "
+        f"{len(completed_set & set(selection_t))} already done, "
         f"{len(remaining)} to go "
         f"(Q{options['quality']}, upscale={'on' if options['upscale'] else 'off'})"
     )
@@ -1587,7 +1562,7 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
     loop = asyncio.get_running_loop()
     all_ok = True
 
-    for season, episode in selection:
+    for season, episode in selection_t:
         if cancel_event.is_set():
             await ctx.send("🛑 Series cancelled.")
             break
@@ -1598,15 +1573,13 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
 
         ep_info = {"season": season, "episode": episode}
 
-        # --- Disk completeness check: mark as done if already on disk ---
         if episode_or_movie_in_disk(title, ep_info, progress.quality_choice):
             await ctx.send(
                 f"⏭️ S{season:02d}E{episode:02d} already complete on disk, skipping"
             )
-            key = [season, episode]
-            if key not in progress.completed_episodes:
-                progress.completed_episodes.append(key)
-            completed_set.add((season, episode))
+            if (season, episode) not in completed_set:
+                progress.completed_episodes.append((season, episode))
+                completed_set.add((season, episode))
             progress.downloaded_episodes = len(progress.completed_episodes)
             progress.save()
             continue
@@ -1625,14 +1598,14 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
         )
 
         if ok:
-            key = [season, episode]
-            if key not in progress.completed_episodes:
-                progress.completed_episodes.append(key)
-            completed_set.add((season, episode))
+            if (season, episode) not in completed_set:
+                progress.completed_episodes.append((season, episode))
+                completed_set.add((season, episode))
             progress.downloaded_episodes = len(progress.completed_episodes)
             progress.failed_episodes = [
                 f for f in progress.failed_episodes
-                if not (f["season"] == season and f["episode"] == episode)
+                if not (isinstance(f, dict)
+                        and f.get("season") == season and f.get("episode") == episode)
             ]
         else:
             if cancel_event.is_set():
@@ -1660,7 +1633,8 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
     if all_ok:
         await ctx.send(f"🎉 **{title}** — all selected episodes downloaded!")
     else:
-        failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
+        failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes
+                           if isinstance(e, dict))
         await ctx.send(
             f"⚠️ **{title}** — done with failures: {failed}\n"
             f"💡 Use `!dlurl <m3u8_url> <title>` to supply a manual source for a failed episode."
@@ -1679,7 +1653,7 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
                 f"{progress.downloaded_episodes}/{progress.total_episodes} downloaded, "
                 f"{len(progress.failed_episodes)} failed: "
                 + ", ".join(f"S{e['season']}E{e['episode']}"
-                            for e in progress.failed_episodes)
+                            for e in progress.failed_episodes if isinstance(e, dict))
             )
     except Exception as e:
         print(f"[dm] {e}")
@@ -1702,7 +1676,6 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
     progress.total_episodes = 1
     progress.downloaded_episodes = 0
     progress.completed_episodes = []
-    progress.selected_episodes = [["movie", "movie"]]   # ← moved here
     progress.in_progress = True
     progress.completed = False
     progress.completed_at = None
@@ -1732,7 +1705,7 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
 
     if ok:
         progress.downloaded_episodes = 1
-        progress.completed_episodes = [["movie", "movie"]]
+        progress.completed_episodes = [("movie", "movie")]
         progress.completed = True
         progress.in_progress = False
         progress.completed_at = time.time()
@@ -1753,6 +1726,65 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
         print(f"[dm] {e}")
 
 
+async def run_movie_resume(ctx, info, options, job_id, cancel_event):
+    """Resume an interrupted movie download without resetting progress."""
+    imdb_id = info["imdb_id"]
+    title = info["title"]
+
+    progress = DownloadProgress.load()
+    if not progress:
+        await ctx.send("❌ No saved progress to resume.")
+        return
+
+    progress.in_progress = True
+    progress.completed = False
+    progress.completed_at = None
+    if not progress.start_time:
+        progress.start_time = time.time()
+    progress.save()
+
+    loop = asyncio.get_running_loop()
+    url = construct_vidcore_url(imdb_id, False)
+
+    ok = await asyncio.to_thread(
+        download_one,
+        url, title, None, progress,
+        lambda m: notify(ctx.channel, m),
+        loop,
+        ctx.channel,
+        job_id,
+        cancel_event,
+        True, 0
+    )
+
+    if cancel_event.is_set():
+        progress.in_progress = False
+        progress.save()
+        return
+
+    if ok:
+        progress.downloaded_episodes = 1
+        progress.completed_episodes = [("movie", "movie")]
+        progress.completed = True
+        progress.in_progress = False
+        progress.completed_at = time.time()
+        progress.save()
+        await ctx.send(f"🎉 **{title}** — resumed and downloaded!")
+    else:
+        progress.in_progress = False
+        progress.save()
+        await ctx.send(f"⚠️ **{title}** — resume failed.")
+
+    try:
+        dm = await ctx.author.create_dm()
+        if ok:
+            await dm.send(f"🎉 Done!\n**{title}** resumed and downloaded successfully.")
+        else:
+            await dm.send(f"⚠️ **{title}** — resume failed.")
+    except Exception as e:
+        print(f"[dm] {e}")
+
+
 async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
     title = info["title"]
 
@@ -1769,7 +1801,6 @@ async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
     progress.total_episodes = 1
     progress.downloaded_episodes = 0
     progress.completed_episodes = []
-    progress.selected_episodes = [["movie", "movie"]]   # ← added
     progress.in_progress = True
     progress.completed = False
     progress.completed_at = None
@@ -1798,7 +1829,7 @@ async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
 
     if ok:
         progress.downloaded_episodes = 1
-        progress.completed_episodes = [["movie", "movie"]]
+        progress.completed_episodes = [("movie", "movie")]
         progress.completed = True
         progress.in_progress = False
         progress.completed_at = time.time()
@@ -1939,6 +1970,9 @@ async def run_job(job):
         elif job.kind == "movie":
             await run_movie(job.ctx, job.info, job.options,
                             job.job_id, job.cancel_event)
+        elif job.kind == "movie_resume":
+            await run_movie_resume(job.ctx, job.info, job.options,
+                                   job.job_id, job.cancel_event)
         elif job.kind == "movie_url":
             await run_movie_with_url(job.ctx, job.info, job.options,
                                      job.manual_url, job.job_id, job.cancel_event)
@@ -1993,7 +2027,7 @@ async def on_ready():
         return
     AUTO_RESUMED_ONCE = True
 
-    # --- Resume in-flight manual downloads ---
+    # --- Resume in-flight manual downloads (URL-based) ---
     mstate = MovieDownloadsState.load()
     if mstate.entries:
         state = load_state() or {}
@@ -2009,7 +2043,6 @@ async def on_ready():
 
         if channel:
             for prefix, entry in list(mstate.entries.items()):
-                # Skip if it's already complete on disk
                 if is_download_complete_on_disk(prefix):
                     print(f"[resume] {prefix} already complete on disk — clearing state")
                     mstate.remove(prefix)
@@ -2037,22 +2070,23 @@ async def on_ready():
                 job.manual_url = entry["url"]
                 enqueue(job)
 
-    # --- Resume series / movie only if it was actually in progress ---
+    # --- Resume series / movie from download_progress.pkl ---
     p = DownloadProgress.load()
     if not p:
         print("[resume] No saved progress file.")
         return
 
     if p.completed:
-        print(f"[resume] Job '{p.title}' already completed — skipping.")
+        print(f"[resume] '{p.title}' already completed — skipping.")
         return
 
-    if not hasattr(p, "completed_episodes"):
-        p.completed_episodes = []
-
-    # Only resume if the flag says we were actively downloading
     if not getattr(p, "in_progress", False):
-        print(f"[resume] Job '{p.title}' not marked in_progress — skipping.")
+        print(f"[resume] '{p.title}' not marked in_progress — skipping.")
+        return
+
+    # Manual downloads are handled via movie_downloads.pkl above
+    if p.kind == "movie_url":
+        print(f"[resume] '{p.title}' is a manual URL — handled via movie_downloads.pkl.")
         return
 
     if p.total_episodes and p.downloaded_episodes >= p.total_episodes:
@@ -2074,13 +2108,6 @@ async def on_ready():
             print(f"[resume] Channel not found: {e}")
             return
 
-    completed_count = len(p.completed_episodes)
-    await channel.send(
-        f"♻️ Auto-resuming **{p.title}** "
-        f"({completed_count}/{p.total_episodes} done, skipping completed)"
-    )
-
-    info = {"imdb_id": p.imdb_id, "title": p.title, "seasons": p.season_episode_counts}
     opts = {
         "quality": p.quality_choice,
         "additional": p.additional_choice,
@@ -2088,13 +2115,29 @@ async def on_ready():
         "upscale": p.upscale,
     }
 
-    selection = p.selected_episodes or \
-        [(s, e) for s in sorted(p.season_episode_counts)
-         for e in range(1, p.season_episode_counts[s] + 1)]
+    if p.kind == "series":
+        info = {"imdb_id": p.imdb_id, "title": p.title,
+                "seasons": p.season_episode_counts}
+        selection = p.selected_episodes or \
+            [(s, e) for s in sorted(p.season_episode_counts)
+             for e in range(1, p.season_episode_counts[s] + 1)]
+        selection = [(s, e) for s, e in selection]
 
-    job = Job("series", _JobCtx(channel, _StubUser(owner_id)), info, opts, selection)
-    enqueue(job)
-    await channel.send(f"♻️ Auto-resume queued as job #{job.job_id}.")
+        completed_count = len(p.completed_episodes)
+        await channel.send(
+            f"♻️ Auto-resuming series **{p.title}** "
+            f"({completed_count}/{p.total_episodes} done, skipping completed)"
+        )
+        job = Job("series", _JobCtx(channel, _StubUser(owner_id)), info, opts, selection)
+        enqueue(job)
+        await channel.send(f"♻️ Auto-resume queued as job #{job.job_id}.")
+
+    elif p.kind == "movie":
+        await channel.send(f"♻️ Auto-resuming movie **{p.title}**")
+        info = {"imdb_id": p.imdb_id, "title": p.title, "type": "movie"}
+        job = Job("movie_resume", _JobCtx(channel, _StubUser(owner_id)), info, opts)
+        enqueue(job)
+        await channel.send(f"♻️ Auto-resume queued as job #{job.job_id}.")
 
 
 # =============================================================
@@ -2218,6 +2261,7 @@ async def dl(ctx, *, query: str):
             await ctx.send("❌ No range selected. Aborting.")
             return
 
+        selection = [(s, e) for s, e in selection]
         await ctx.send(f"▶️ {len(selection)} episodes selected.")
 
         job = Job("series", _JobCtx(ctx.channel, ctx.author), info, options, selection)
@@ -2309,7 +2353,7 @@ async def status(ctx):
     is_movie = (
         p.total_episodes == 1
         and not p.season_episode_counts
-        and (p.completed_episodes == [["movie", "movie"]] or not p.selected_episodes)
+        and (list(p.completed_episodes) == [("movie", "movie")] or not p.selected_episodes)
     )
 
     if is_movie:
