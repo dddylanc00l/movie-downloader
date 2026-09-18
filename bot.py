@@ -1702,6 +1702,7 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
     progress.total_episodes = 1
     progress.downloaded_episodes = 0
     progress.completed_episodes = []
+    progress.selected_episodes = [["movie", "movie"]]   # ← moved here
     progress.in_progress = True
     progress.completed = False
     progress.completed_at = None
@@ -1768,6 +1769,7 @@ async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
     progress.total_episodes = 1
     progress.downloaded_episodes = 0
     progress.completed_episodes = []
+    progress.selected_episodes = [["movie", "movie"]]   # ← added
     progress.in_progress = True
     progress.completed = False
     progress.completed_at = None
@@ -2037,25 +2039,24 @@ async def on_ready():
 
     # --- Resume series / movie only if it was actually in progress ---
     p = DownloadProgress.load()
-    if not p or p.completed:
+    if not p:
+        print("[resume] No saved progress file.")
+        return
+
+    if p.completed:
+        print(f"[resume] Job '{p.title}' already completed — skipping.")
         return
 
     if not hasattr(p, "completed_episodes"):
         p.completed_episodes = []
 
-    if p.imdb_id == "manual" or p.kind == "movie_url":
-        return
-
     # Only resume if the flag says we were actively downloading
     if not getattr(p, "in_progress", False):
-        print("[resume] Job not marked in_progress — skipping resume.")
-        return
-
-    if p.kind == "movie" and not p.selected_episodes:
+        print(f"[resume] Job '{p.title}' not marked in_progress — skipping.")
         return
 
     if p.total_episodes and p.downloaded_episodes >= p.total_episodes:
-        print("[resume] Already at 100% — skipping resume.")
+        print(f"[resume] '{p.title}' already at 100% — skipping.")
         return
 
     state = load_state() or {}
