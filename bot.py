@@ -2,16 +2,16 @@
 """
 VidCore Discord Downloader — Raspberry Pi edition
 
-Fixes:
+Fixes in this version:
 - Resume bug: on_ready branches on kind (series/movie/movie_url) and only
-  resumes jobs that were actually in_progress. Movies resume via their own
-  handler instead of being misrouted through run_series.
-- MP4 verification: no more aggressive -err_detect explode -xerror. Faststart
+  resumes jobs that were actually in_progress.
+- MP4 verification: dropped aggressive -err_detect explode -xerror. Faststart
   failures keep the original file rather than losing the download.
-- completed_episodes entries are normalized to tuples so legacy pickles
-  containing ["movie", "movie"] can't crash set operations.
-- .part files may land next to the output; completeness + cleanup scans
-  the whole tree, so their location doesn't matter.
+- Deterministic filenames (no timestamp for named downloads) so --continue
+  can actually resume interrupted downloads across restarts.
+- Pre-download check: skips if already on disk, resumes from .part if present,
+  deletes stale partials when nothing can be resumed.
+- completed_episodes normalized to tuples for safe set operations.
 """
 
 import subprocess
@@ -129,7 +129,6 @@ def safe_delete(path):
 
 
 def cleanup_download_artifacts(output_prefix):
-    """Delete every file/folder matching the download prefix, anywhere."""
     try:
         touched_dirs = set()
         for root, dirs, files in os.walk(MOVIES_FOLDER):
@@ -176,14 +175,12 @@ def find_downloaded_file_anywhere(base_name):
 def is_download_complete_on_disk(base_name, min_size_mb=10):
     min_bytes = min_size_mb * 1024 * 1024
 
-    # Any .part anywhere → not complete
     for root, dirs, files in os.walk(MOVIES_FOLDER):
         dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
         for f in files:
             if f.startswith(base_name) and f.endswith(".part"):
                 return False
 
-    # Any tmp fragment dir for this prefix → not complete
     try:
         for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
             if entry.startswith(base_name):
@@ -436,8 +433,6 @@ class MovieDownloadsState:
 # Progress
 # =============================================================
 def _normalize_ep_list(raw_list):
-    """Convert a list of [s,e] / (s,e) into a list of (s,e) tuples.
-    Silently drops entries that aren't 2-element sequences."""
     out = []
     for item in raw_list or []:
         if isinstance(item, (list, tuple)) and len(item) == 2:
@@ -498,7 +493,6 @@ class DownloadProgress:
             if not hasattr(obj, name):
                 setattr(obj, name, default)
 
-        # Normalize episode lists to tuples so set operations never blow up.
         obj.completed_episodes = _normalize_ep_list(obj.completed_episodes)
         obj.selected_episodes = _normalize_ep_list(obj.selected_episodes)
         return obj
@@ -744,10 +738,6 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
 
 
 def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
-    """
-    Stream-copy +faststart pass. Permissive: no -err_detect explode,
-    no -xerror. On any failure, keep the original and return its path.
-    """
     if not os.path.exists(input_file):
         if status_cb: status_cb("❌ File not found for faststart pass.")
         return None
@@ -831,8 +821,6 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
     if status_cb:
         status_cb("✅ MP4 is seekable (faststart).")
     return input_file
-
-
 # =============================================================
 # yt-dlp runner
 # =============================================================
@@ -854,15 +842,16 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     }
     fmt = quality_map.get(progress.quality_choice, "bestvideo+bestaudio/best")
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "").replace(' ', '_')
+
     if title:
-        safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
         if episode_info:
             base_name = (f"{safe}_S{episode_info['season']:02d}"
                          f"E{episode_info['episode']:02d}_Q{progress.quality_choice}")
         else:
-            base_name = f"{safe}_{ts}_Q{progress.quality_choice}"
+            base_name = f"{safe}_Q{progress.quality_choice}"
     else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = f"video_{ts}"
 
     if episode_info:
@@ -870,8 +859,56 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         os.makedirs(out_dir, exist_ok=True)
     else:
         out_dir = MOVIES_FOLDER
+
     out_path = os.path.join(out_dir, base_name + ".%(ext)s")
     temp_dir = os.path.join(MOVIES_FOLDER, TEMP_FOLDER)
+
+    # ---------- Pre-download check & cleanup ----------
+    if is_download_complete_on_disk(base_name):
+        set_status(f"⏭️ already on disk: {base_name}", force=True)
+        MovieDownloadsState.load().remove(base_name)
+        return True
+
+    has_part = False
+    has_tmp = False
+    final_files = []
+
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if not f.startswith(base_name):
+                continue
+            if f.endswith(".part"):
+                has_part = True
+            elif "_4k" not in f:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
+                    final_files.append(os.path.join(root, f))
+
+    try:
+        for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
+            if entry.startswith(base_name):
+                has_tmp = True
+                break
+    except Exception:
+        pass
+
+    # Stale final file with nothing to resume from → delete it.
+    if not has_part and not has_tmp and final_files:
+        for f in final_files:
+            safe_delete(f)
+            print(f"[_ytdlp_run] deleted stale final file: {f}")
+        set_status("🧹 cleaned stale partial — starting fresh", force=True)
+
+    # .part exists but a final file also lingers → delete the final file,
+    # keep the .part so --continue can resume from it.
+    elif has_part and final_files:
+        for f in final_files:
+            safe_delete(f)
+            print(f"[_ytdlp_run] deleted stale final file (part present): {f}")
+        set_status("🧹 cleaned stale final — resuming from .part", force=True)
+
+    # ---------- end pre-download check ----------
 
     yt_cmd = [
         PYTHON_PATH, "-m", YTDLP_MODULE,
@@ -1186,7 +1223,10 @@ def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, cha
         retry_fn=lambda r: download_from_url(m3u8_url, title, episode_info,
                                              progress, notify, loop, channel,
                                              job_id, cancel_event, is_movie, r)
-    )# =============================================================
+    )
+
+
+# =============================================================
 # Selection parser
 # =============================================================
 def make_range_selection(start, end, seasons):
@@ -1548,7 +1588,7 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
 
-    completed_set = set(progress.completed_episodes)  # already tuples
+    completed_set = set(progress.completed_episodes)
     selection_t = [(s, e) for s, e in selection]
     remaining = [ep for ep in selection_t if ep not in completed_set]
 
@@ -1727,7 +1767,6 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
 
 
 async def run_movie_resume(ctx, info, options, job_id, cancel_event):
-    """Resume an interrupted movie download without resetting progress."""
     imdb_id = info["imdb_id"]
     title = info["title"]
 
@@ -2084,7 +2123,6 @@ async def on_ready():
         print(f"[resume] '{p.title}' not marked in_progress — skipping.")
         return
 
-    # Manual downloads are handled via movie_downloads.pkl above
     if p.kind == "movie_url":
         print(f"[resume] '{p.title}' is a manual URL — handled via movie_downloads.pkl.")
         return
