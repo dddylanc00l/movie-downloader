@@ -165,7 +165,7 @@ def find_downloaded_file_anywhere(base_name):
         dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
         for f in files:
             if f.startswith(base_name) and not f.endswith(".part") \
-                    and "_4k" not in f:
+                    and ".faststart." not in f.lower() and "_4k" not in f:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
                     return os.path.join(root, f)
@@ -748,6 +748,12 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
 
     tmp_file = f"{base}.faststart{ext}"
 
+    # A restart can interrupt FFmpeg before it replaces the original file.
+    # Do not let that partial output interfere with this retry.
+    if os.path.exists(tmp_file):
+        print(f"[faststart] removing stale tmp: {tmp_file}")
+        safe_delete(tmp_file)
+
     if status_cb:
         status_cb(f"🔧 Making seekable: {os.path.basename(input_file)}")
 
@@ -865,6 +871,16 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
     # ---------- Pre-download check & cleanup ----------
     if is_download_complete_on_disk(base_name):
+        actual = find_downloaded_file_anywhere(base_name)
+        if actual and progress.additional_choice != "2":
+            # A prior run may have exited after yt-dlp finished but before
+            # faststart replaced the file.  Re-run the stream-copy pass on
+            # completed resume candidates so they remain seekable.
+            verify_and_faststart(
+                actual,
+                status_cb=lambda m: set_status(m, force=True),
+                cancel_event=cancel_event,
+            )
         set_status(f"⏭️ already on disk: {base_name}", force=True)
         MovieDownloadsState.load().remove(base_name)
         return True
@@ -880,7 +896,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
                 continue
             if f.endswith(".part"):
                 has_part = True
-            elif "_4k" not in f:
+            elif ".faststart." not in f.lower() and "_4k" not in f:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
                     final_files.append(os.path.join(root, f))
@@ -2083,9 +2099,10 @@ async def on_ready():
         if channel:
             for prefix, entry in list(mstate.entries.items()):
                 if is_download_complete_on_disk(prefix):
-                    print(f"[resume] {prefix} already complete on disk — clearing state")
-                    mstate.remove(prefix)
-                    continue
+                    # Still enqueue this entry: _ytdlp_run will skip yt-dlp,
+                    # but first retries faststart in case the previous process
+                    # stopped between download completion and that final pass.
+                    print(f"[resume] {prefix} complete on disk — verifying faststart")
 
                 await channel.send(
                     f"♻️ Resuming manual download **{entry['title']}** (prefix `{prefix}`)"
