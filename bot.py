@@ -28,6 +28,8 @@ import shutil
 import requests
 import threading
 import queue
+import io
+import zipfile
 from collections import deque
 from datetime import datetime
 
@@ -86,6 +88,8 @@ YTDLP_MODULE = "yt_dlp"
 CONCURRENT_FRAGMENTS = 5
 STATUS_EDIT_INTERVAL = 8.0
 SUBTITLE_LANGS = "en.*,nl.*"
+OPENSUBS_API_URL = "https://api.opensubtitles.com/api/v1"
+OPENSUBS_LANGUAGES = ("en", "nl")
 
 if not DISCORD_TOKEN:
     print("❌ DISCORD_TOKEN is empty. Check credentials.txt.")
@@ -204,6 +208,117 @@ def find_subtitle_file(base_name):
                     f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
                 return os.path.join(root, f)
     return None
+
+
+def _opensubs_headers():
+    return {
+        "Api-Key": OPENSUBS_KEY,
+        "User-Agent": "VidCore-Discord-Downloader/1.0",
+        "Accept": "application/json",
+    }
+
+
+def _opensubs_content(response):
+    """Return the SRT payload, including when the service returned a ZIP."""
+    data = response.content
+    if data.startswith(b"PK\x03\x04"):
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            srt_name = next(
+                (name for name in archive.namelist()
+                 if name.lower().endswith(".srt") and not name.endswith("/")),
+                None,
+            )
+            if not srt_name:
+                return None
+            return archive.read(srt_name)
+    return data
+
+
+def download_opensubtitles(base_name, title, imdb_id, episode_info=None,
+                           status_cb=None):
+    """Save the best available English and Dutch OpenSubtitles tracks."""
+    if not OPENSUBS_KEY:
+        print("[opensubtitles] no OPENSUBTITLES_API_KEY configured; skipping")
+        return []
+
+    params = {
+        "languages": ",".join(OPENSUBS_LANGUAGES),
+        "order_by": "download_count",
+        "order_direction": "desc",
+    }
+    numeric_imdb_id = str(imdb_id or "").lower().removeprefix("tt").lstrip("0")
+    if episode_info and numeric_imdb_id.isdigit():
+        params.update({
+            "parent_imdb_id": numeric_imdb_id,
+            "season_number": episode_info["season"],
+            "episode_number": episode_info["episode"],
+        })
+    elif numeric_imdb_id.isdigit():
+        params["imdb_id"] = numeric_imdb_id
+    elif title:
+        # Manual URLs have no IMDb ID; title search is less exact but useful.
+        params["query"] = title
+    else:
+        return []
+
+    try:
+        response = requests.get(f"{OPENSUBS_API_URL}/subtitles", params=params,
+                                headers=_opensubs_headers(), timeout=30)
+        response.raise_for_status()
+        results = response.json().get("data", [])
+    except Exception as e:
+        print(f"[opensubtitles] search failed: {e}")
+        return []
+
+    best_by_language = {}
+    for result in results:
+        attrs = result.get("attributes", {})
+        language = (attrs.get("language") or "").lower()
+        files = attrs.get("files") or []
+        if language not in OPENSUBS_LANGUAGES or not files:
+            continue
+        candidate = (not attrs.get("hearing_impaired", False),
+                     attrs.get("from_trusted", False),
+                     attrs.get("download_count", 0), attrs.get("ratings", 0))
+        current = best_by_language.get(language)
+        if current is None or candidate > current[0]:
+            best_by_language[language] = (candidate, files[0].get("file_id"))
+
+    saved = []
+    for language in OPENSUBS_LANGUAGES:
+        output_file = f"{base_name}.{language}.srt"
+        if os.path.exists(output_file):
+            saved.append(language)
+            continue
+        selected = best_by_language.get(language)
+        if not selected or not selected[1]:
+            continue
+        try:
+            link_response = requests.post(
+                f"{OPENSUBS_API_URL}/download",
+                params={"file_id": selected[1], "sub_format": "srt"},
+                headers=_opensubs_headers(), timeout=30,
+            )
+            link_response.raise_for_status()
+            download_url = link_response.json()["link"]
+            subtitle_response = requests.get(download_url, timeout=60)
+            subtitle_response.raise_for_status()
+            content = _opensubs_content(subtitle_response)
+            if not content:
+                raise ValueError("subtitle download contained no SRT track")
+            with open(output_file, "wb") as subtitle_file:
+                subtitle_file.write(content)
+            saved.append(language)
+            print(f"[opensubtitles] saved {output_file}")
+        except Exception as e:
+            print(f"[opensubtitles] {language} download failed: {e}")
+
+    if status_cb:
+        if saved:
+            status_cb(f"💬 OpenSubtitles saved: {', '.join(saved)}")
+        else:
+            status_cb("💬 OpenSubtitles: no English or Dutch subtitle found")
+    return saved
 
 
 def episode_or_movie_in_disk(title, episode_info, quality):
@@ -872,6 +987,11 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     # ---------- Pre-download check & cleanup ----------
     if is_download_complete_on_disk(base_name):
         actual = find_downloaded_file_anywhere(base_name)
+        if actual and progress.subtitles:
+            download_opensubtitles(
+                os.path.splitext(actual)[0], title, progress.imdb_id, episode_info,
+                status_cb=lambda m: set_status(m, force=True),
+            )
         if actual and progress.additional_choice != "2":
             # A prior run may have exited after yt-dlp finished but before
             # faststart replaced the file.  Re-run the stream-copy pass on
@@ -1011,13 +1131,19 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
 
     if progress.subtitles and not find_subtitle_file(base_name):
         _upscale_post(loop, channel,
-                      f"⚠️ No subtitles available in this stream — "
-                      f"none saved for `{base_name}`")
+                      f"ℹ️ No subtitles available in this stream — "
+                      f"checking OpenSubtitles for `{base_name}`")
 
     actual = find_downloaded_file_anywhere(base_name)
     if not actual:
         set_status("❌ could not find downloaded file", force=True)
         return False
+
+    if progress.subtitles:
+        download_opensubtitles(
+            os.path.splitext(actual)[0], title, progress.imdb_id, episode_info,
+            status_cb=lambda m: set_status(m, force=True),
+        )
 
     want_upscale = progress.upscale and progress.additional_choice != "2" \
         and progress.quality_choice in ("1", "2", "3")
