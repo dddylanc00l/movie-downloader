@@ -235,10 +235,17 @@ def _opensubs_content(response):
 
 
 def download_opensubtitles(base_name, title, imdb_id, episode_info=None,
-                           status_cb=None):
+                           status_cb=None, report_cb=None):
     """Save the best available English and Dutch OpenSubtitles tracks."""
+    def report(message):
+        print(f"[opensubtitles] {message}")
+        if status_cb:
+            status_cb(message)
+        if report_cb:
+            report_cb(message)
+
     if not OPENSUBS_KEY:
-        print("[opensubtitles] no OPENSUBTITLES_API_KEY configured; skipping")
+        report("⚠️ OpenSubtitles skipped: OPENSUBTITLES_API_KEY is not configured")
         return []
 
     params = {
@@ -267,7 +274,7 @@ def download_opensubtitles(base_name, title, imdb_id, episode_info=None,
         response.raise_for_status()
         results = response.json().get("data", [])
     except Exception as e:
-        print(f"[opensubtitles] search failed: {e}")
+        report(f"⚠️ OpenSubtitles search failed: {e}")
         return []
 
     best_by_language = {}
@@ -311,13 +318,12 @@ def download_opensubtitles(base_name, title, imdb_id, episode_info=None,
             saved.append(language)
             print(f"[opensubtitles] saved {output_file}")
         except Exception as e:
-            print(f"[opensubtitles] {language} download failed: {e}")
+            report(f"⚠️ OpenSubtitles {language} download failed: {e}")
 
-    if status_cb:
-        if saved:
-            status_cb(f"💬 OpenSubtitles saved: {', '.join(saved)}")
-        else:
-            status_cb("💬 OpenSubtitles: no English or Dutch subtitle found")
+    if saved:
+        report(f"💬 OpenSubtitles saved: {', '.join(saved)}")
+    else:
+        report("💬 OpenSubtitles: no English or Dutch subtitle found")
     return saved
 
 
@@ -991,6 +997,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
             download_opensubtitles(
                 os.path.splitext(actual)[0], title, progress.imdb_id, episode_info,
                 status_cb=lambda m: set_status(m, force=True),
+                report_cb=lambda m: _upscale_post(loop, channel, m),
             )
         if actual and progress.additional_choice != "2":
             # A prior run may have exited after yt-dlp finished but before
@@ -1143,6 +1150,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         download_opensubtitles(
             os.path.splitext(actual)[0], title, progress.imdb_id, episode_info,
             status_cb=lambda m: set_status(m, force=True),
+            report_cb=lambda m: _upscale_post(loop, channel, m),
         )
 
     want_upscale = progress.upscale and progress.additional_choice != "2" \
