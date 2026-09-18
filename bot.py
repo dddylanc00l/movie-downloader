@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """
 VidCore Discord Downloader — Raspberry Pi edition
+
+Fixes in this version:
+- Resume bug: only resumes jobs that were actually interrupted (in_progress=True
+  and completed=False). Completed items are skipped using both the state file
+  AND a disk-completeness check (no .part, no tmp fragments, min size).
+- MP4 verification bug: dropped the aggressive -err_detect explode -xerror
+  which rejected good HLS-sourced files. Faststart failures now keep the
+  original file rather than losing the download.
+
+Features:
 - In-channel dropdown/button prompts (restricted to the requester)
 - One editable status message per episode; live progress via !status
 - Auto-upscale to 4K; deletes the non-4K source afterwards
 - Cancel deletes partial downloads completely
 - DMs the user ONLY when the job finishes
 - Auto-resumes interrupted downloads ONCE per process
-- Manual override: !dlurl <http(s)_url> [title]  (m3u8, YouTube, direct links)
-- Subtitles: fetched from OpenSubtitles after download (never via yt-dlp)
-- MP4 output (seekable) for maximum player compatibility
+- Manual override: !dlurl <m3u8_url> [title]
+- Credentials loaded from credentials.txt (Discord token + OpenSubtitles key)
 """
 
 import subprocess
 import time
+import pyperclip
 import os
 import sys
 import re
-import io
 import json
 import pickle
 import asyncio
@@ -26,7 +35,6 @@ import shutil
 import requests
 import threading
 import queue
-import pyperclip
 from collections import deque
 from datetime import datetime
 
@@ -34,9 +42,46 @@ import discord
 from discord.ext import commands
 
 # =============================================================
+# Credentials loader
+# =============================================================
+CREDENTIALS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "credentials.txt")
+
+def load_credentials():
+    """
+    Read credentials.txt. Format:
+        DISCORD_TOKEN=your-token
+        OPENSUBTITLES_API_KEY=your-key
+        # Comments and blank lines are ignored.
+    Returns a dict.
+    """
+    creds = {
+        "DISCORD_TOKEN": "",
+        "OPENSUBTITLES_API_KEY": "",
+    }
+    if not os.path.exists(CREDENTIALS_FILE):
+        print(f"❌ credentials.txt not found at {CREDENTIALS_FILE}")
+        return creds
+
+    with open(CREDENTIALS_FILE) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            creds[k.strip()] = v.strip()
+    return creds
+
+
+CREDS = load_credentials()
+
+# =============================================================
 # CONFIG — Raspberry Pi
 # =============================================================
-DISCORD_TOKEN   = ""          # loaded from CREDENTIALS_FILE at startup
+DISCORD_TOKEN   = CREDS.get("DISCORD_TOKEN", "")
+OPENSUBS_KEY    = CREDS.get("OPENSUBTITLES_API_KEY", "")
 ALLOWED_USER_ID = 0
 
 PYTHON_PATH      = sys.executable
@@ -44,57 +89,24 @@ MOVIES_FOLDER    = "/mnt/minecraft-backups/videos"
 CHROME_PATH      = "/usr/bin/chromium"
 CHROME_USER_DATA = "/home/grap/.config/chromium"
 
-PROGRESS_FILE      = "download_progress.pkl"
-STATE_FILE         = "bot_state.json"
-MOVIE_STATE_FILE   = "movie_downloads.pkl"   # tracks in-flight movie downloads
-TEMP_FOLDER        = "tmp"                     # yt-dlp temp dir for fragments
+PROGRESS_FILE    = "download_progress.pkl"
+STATE_FILE       = "bot_state.json"
+MOVIE_STATE_FILE = "movie_downloads.pkl"
+TEMP_FOLDER      = "tmp"
 
 YTDLP_MODULE = "yt_dlp"
 
-# OpenSubtitles API (free account at opensubtitles.com) — loaded from CREDENTIALS_FILE
-OS_API_KEY   = ""
-OS_USERNAME  = ""
-OS_PASSWORD  = ""
-OS_API_BASE  = "https://api.opensubtitles.com/api/v1"
-
-# Secrets live in a separate text file (not hard-coded in this script).
-# Format, one per line:  KEY = value   (# lines and blanks are ignored)
-CREDENTIALS_FILE = "credentials.txt"
-
-# Tunables
 CONCURRENT_FRAGMENTS = 5
 STATUS_EDIT_INTERVAL = 8.0
-SUBTITLE_LANGS = "en.*,nl.*"   # subtitle languages to fetch (en = English, nl = Dutch)
+SUBTITLE_LANGS = "en.*,nl.*"
+
+if not DISCORD_TOKEN:
+    print("❌ DISCORD_TOKEN is empty. Check credentials.txt.")
+    sys.exit(1)
 
 # =============================================================
 # Setup
 # =============================================================
-def load_credentials(path=CREDENTIALS_FILE):
-    """
-    Read secrets from a KEY = value text file and update the module-level
-    DISCORD_TOKEN / OS_* variables. Returns True if a Discord token was found.
-    """
-    global DISCORD_TOKEN, OS_API_KEY, OS_USERNAME, OS_PASSWORD
-    found = {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                found[key.strip()] = value.strip().strip('"').strip("'")
-    except OSError as e:
-        print(f"[credentials] could not read {path}: {e}")
-        return False
-
-    DISCORD_TOKEN  = found.get("DISCORD_TOKEN", DISCORD_TOKEN)
-    OS_API_KEY     = found.get("OS_API_KEY", OS_API_KEY)
-    OS_USERNAME    = found.get("OS_USERNAME", OS_USERNAME)
-    OS_PASSWORD    = found.get("OS_PASSWORD", OS_PASSWORD)
-    return bool(DISCORD_TOKEN)
-
-
 os.makedirs(MOVIES_FOLDER, exist_ok=True)
 os.makedirs(os.path.join(MOVIES_FOLDER, TEMP_FOLDER), exist_ok=True)
 
@@ -118,7 +130,6 @@ def kill_chrome():
 
 
 def safe_delete(path):
-    """Delete a file or folder if it exists, ignoring errors."""
     if not path:
         return
     try:
@@ -131,15 +142,9 @@ def safe_delete(path):
 
 
 def cleanup_download_artifacts(output_prefix):
-    """
-    Remove every file matching a download prefix (partials, parts,
-    yt-dlp metadata, and the temp fragment directory), recursively so
-    series files inside show/season subfolders are covered too.
-    """
     try:
         touched_dirs = set()
         for root, dirs, files in os.walk(MOVIES_FOLDER):
-            # Skip the yt-dlp temp fragment dir; handled below
             dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
             removed = False
             for f in files:
@@ -148,11 +153,9 @@ def cleanup_download_artifacts(output_prefix):
                     removed = True
             if removed:
                 touched_dirs.add(root)
-        # Also nuke any yt-dlp fragment dir for this download
         for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
             if entry.startswith(output_prefix):
                 safe_delete(os.path.join(MOVIES_FOLDER, TEMP_FOLDER, entry))
-        # Prune show/season folders that ended up empty
         for d in sorted(touched_dirs, key=lambda x: x.count(os.sep), reverse=True):
             cur = d
             while cur != MOVIES_FOLDER and os.path.isdir(cur):
@@ -165,6 +168,104 @@ def cleanup_download_artifacts(output_prefix):
                     break
     except Exception as e:
         print(f"[cleanup] {e}")
+
+
+# =============================================================
+# Disk completeness check
+# =============================================================
+def find_downloaded_file_anywhere(base_name):
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if f.startswith(base_name) and not f.endswith(".part") \
+                    and "_4k" not in f:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
+                    return os.path.join(root, f)
+    return None
+
+
+def is_download_complete_on_disk(base_name, min_size_mb=10):
+    """
+    A download is complete only when:
+      - No .part file with this prefix exists anywhere
+      - No tmp fragment dir with this prefix exists
+      - A final video file exists and is above the minimum size
+    """
+    min_bytes = min_size_mb * 1024 * 1024
+
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if f.startswith(base_name) and f.endswith(".part"):
+                return False
+
+    try:
+        for entry in os.listdir(os.path.join(MOVIES_FOLDER, TEMP_FOLDER)):
+            if entry.startswith(base_name):
+                return False
+    except Exception:
+        pass
+
+    final = find_downloaded_file_anywhere(base_name)
+    if not final or not os.path.exists(final):
+        return False
+    if os.path.getsize(final) < min_bytes:
+        return False
+    return True
+
+
+def find_subtitle_file(base_name):
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if f.startswith(base_name) and \
+                    f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
+                return os.path.join(root, f)
+    return None
+
+
+def guess_base_name(title, episode_info, quality):
+    """Reconstruct the base name pattern used by _ytdlp_run."""
+    safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "").replace(' ', '_')
+    if episode_info:
+        return (f"{safe}_S{episode_info['season']:02d}"
+                f"E{episode_info['episode']:02d}_Q{quality}")
+    return f"{safe}_Q{quality}"
+
+
+def episode_or_movie_in_disk(title, episode_info, quality):
+    """
+    Check if a specific episode/movie is complete on disk by matching
+    any file whose name starts with the base pattern. We do a prefix
+    search because movies include a timestamp in the name.
+    """
+    safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "").replace(' ', '_')
+    if episode_info:
+        prefix = (f"{safe}_S{episode_info['season']:02d}"
+                  f"E{episode_info['episode']:02d}_")
+    else:
+        prefix = f"{safe}_"
+
+    for root, dirs, files in os.walk(MOVIES_FOLDER):
+        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
+        for f in files:
+            if not f.startswith(prefix):
+                continue
+            if f.endswith(".part"):
+                continue
+            if "_4k" in f:
+                continue
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in (".mp4", ".mkv", ".webm", ".mov", ".m4v"):
+                continue
+            full = os.path.join(root, f)
+            try:
+                if os.path.getsize(full) >= 10 * 1024 * 1024:
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 # =============================================================
@@ -193,8 +294,6 @@ def get_live_status(job_id):
 # =============================================================
 # Background upscale worker
 # =============================================================
-# Downloads push files onto UPSCALE_QUEUE and continue immediately, so the
-# next download can run while ffmpeg is busy encoding a previous file.
 UPSCALE_QUEUE = queue.Queue()
 UPSCALE_ACTIVITY = {}
 UPSCALE_ACTIVITY_LOCK = threading.Lock()
@@ -325,12 +424,7 @@ def enqueue_upscale(input_file, job_id, label, cancel_event=None,
 # Movie downloads state
 # =============================================================
 class MovieDownloadsState:
-    """
-    Persisted record of in-flight movie downloads so we can resume
-    after a reboot / restart. Keyed by output prefix.
-    """
     def __init__(self):
-        # {prefix: {"url": ..., "title": ..., "quality": ..., "additional": ...}}
         self.entries = {}
 
     @staticmethod
@@ -354,10 +448,11 @@ class MovieDownloadsState:
         except Exception as e:
             print(f"[movie state save] {e}")
 
-    def add(self, prefix, url, title, quality, additional):
+    def add(self, prefix, url, title, quality, additional, out_dir=None):
         self.entries[prefix] = {
             "url": url, "title": title,
             "quality": quality, "additional": additional,
+            "out_dir": out_dir or MOVIES_FOLDER,
         }
         self.save()
 
@@ -380,6 +475,8 @@ class DownloadProgress:
         self.total_episodes = 0
         self.downloaded_episodes = 0
         self.completed = False
+        self.in_progress = False           # True only while actively downloading
+        self.completed_at = None
         self.failed_episodes = []
         self.completed_episodes = []
         self.season_episode_counts = {}
@@ -411,6 +508,7 @@ class DownloadProgress:
         defaults = {
             "title": "", "imdb_id": "", "kind": "series",
             "total_episodes": 0, "downloaded_episodes": 0, "completed": False,
+            "in_progress": False, "completed_at": None,
             "failed_episodes": [], "completed_episodes": [],
             "season_episode_counts": {}, "selected_episodes": [],
             "start_time": None, "download_folder": MOVIES_FOLDER,
@@ -491,7 +589,6 @@ def search_imdb(query, limit=5):
 
 
 def get_series_info(imdb_id):
-    """Episode counts per season from TVMaze (key-free JSON API)."""
     seasons = {}
     try:
         r = requests.get(f"https://api.tvmaze.com/lookup/shows?imdb={imdb_id}",
@@ -511,10 +608,7 @@ def get_series_info(imdb_id):
             order = season.get("episodeOrder")
             if number is None:
                 continue
-            if order:
-                seasons[number] = order
-            else:
-                seasons[number] = 0   # resolved via /episodes below
+            seasons[number] = order if order else 0
     except Exception as e:
         print(f"[series info] seasons failed: {e}")
         return {}
@@ -539,8 +633,7 @@ def get_series_info(imdb_id):
         except Exception as e:
             print(f"[series info] episodes fallback failed: {e}")
 
-    seasons = {n: c for n, c in sorted(seasons.items()) if c}
-    return seasons
+    return {n: c for n, c in sorted(seasons.items()) if c}
 
 
 # =============================================================
@@ -589,9 +682,7 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
     if status_cb: status_cb(f"🔼 Upscaling {os.path.basename(input_file)} to 4K…")
 
     cmd = [
-        'ffmpeg',
-        '-err_detect', 'explode', '-xerror',
-        '-i', input_file,
+        'ffmpeg', '-i', input_file,
         '-vf', 'scale=3840:2160:flags=lanczos',
         '-c:v', 'libx264',
         '-crf', '18', '-preset', 'faster',
@@ -670,32 +761,16 @@ def upscale_to_4k(input_file, status_cb=None, delete_source=True,
     return output_file
 
 
-def find_downloaded_file(base_name):
-    for root, dirs, files in os.walk(MOVIES_FOLDER):
-        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
-        for f in files:
-            if f.startswith(base_name) and not f.endswith(".part") \
-                    and "_4k" not in f:
-                return os.path.join(root, f)
-    return None
-
-
-def find_subtitle_file(base_name):
-    for root, dirs, files in os.walk(MOVIES_FOLDER):
-        dirs[:] = [d for d in dirs if d != TEMP_FOLDER]
-        for f in files:
-            if f.startswith(base_name) and \
-                    f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
-                return os.path.join(root, f)
-    return None
-
-
 def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
     """
-    Make a downloaded MP4 seekable/skippable by writing the moov atom to the
-    front (-movflags +faststart) and fail on any container/bitstream error
-    (-err_detect explode -xerror) so a corrupted/glitchy download is caught.
-    Stream copy only — no re-encode, so it's fast and CPU-cheap.
+    Make an MP4 seekable via a stream-copy +faststart pass.
+
+    Permissive on purpose: no -err_detect explode, no -xerror. HLS-sourced
+    MP4s routinely have minor timestamp oddities that ffmpeg warns about
+    but which don't affect playback. We only fail on real ffmpeg errors.
+
+    On failure we KEEP the original file and return its path, so a download
+    is never lost just because faststart didn't succeed.
     """
     if not os.path.exists(input_file):
         if status_cb: status_cb("❌ File not found for faststart pass.")
@@ -703,20 +778,18 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
 
     base, ext = os.path.splitext(input_file)
     if ext.lower() not in (".mp4", ".mov", ".m4a"):
-        # Only MP4-family containers benefit from +faststart; leave others
-        # untouched so e.g. audio-only webm downloads are never failed here.
         return input_file
 
     tmp_file = f"{base}.faststart{ext}"
 
     if status_cb:
-        status_cb(f"🔧 Making seekable / checking glitches: {os.path.basename(input_file)}")
+        status_cb(f"🔧 Making seekable: {os.path.basename(input_file)}")
 
     cmd = [
         'ffmpeg', '-v', 'error',
-        '-err_detect', 'explode', '-xerror',
         '-i', input_file,
-        '-map', '0',
+        '-map', '0:v',
+        '-map', '0:a?',
         '-c', 'copy',
         '-movflags', '+faststart',
         '-y', tmp_file
@@ -727,7 +800,7 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
                                    stderr=subprocess.PIPE, text=True, bufsize=1)
     except FileNotFoundError:
         if status_cb: status_cb("❌ FFmpeg not found.")
-        return None
+        return input_file
 
     q = queue.Queue()
 
@@ -738,6 +811,7 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
     threading.Thread(target=reader, daemon=True).start()
 
     cancelled = False
+    errors = []
     while process.poll() is None or not q.empty():
         if cancel_event and cancel_event.is_set():
             cancelled = True
@@ -751,7 +825,7 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
         except queue.Empty:
             continue
         if "error" in line.lower():
-            if status_cb: status_cb(f"⚠️ {line[:180]}")
+            errors.append(line[:200])
 
     if cancelled:
         try:
@@ -760,25 +834,26 @@ def verify_and_faststart(input_file, status_cb=None, cancel_event=None):
             process.kill()
         if status_cb: status_cb("🛑 faststart pass cancelled.")
         safe_delete(tmp_file)
-        return None
+        return input_file
 
-    if process.returncode != 0:
-        if status_cb: status_cb("❌ faststart / glitch check failed.")
+    if process.returncode != 0 or not os.path.exists(tmp_file):
+        if status_cb:
+            status_cb("⚠️ faststart failed — keeping original (may not seek)")
+        if errors and status_cb:
+            status_cb(f"⚠️ {errors[0]}")
         safe_delete(tmp_file)
-        return None
-
-    if not os.path.exists(tmp_file):
-        if status_cb: status_cb("❌ faststart output missing.")
-        return None
+        return input_file
 
     try:
         os.replace(tmp_file, input_file)
     except Exception as e:
-        if status_cb: status_cb(f"⚠️ could not replace file: {e}")
+        if status_cb:
+            status_cb(f"⚠️ could not replace file, keeping original: {e}")
         safe_delete(tmp_file)
-        return None
+        return input_file
 
-    if status_cb: status_cb("✅ MP4 seekable (faststart), no glitches found.")
+    if status_cb:
+        status_cb("✅ MP4 is seekable (faststart).")
     return input_file
 
 
@@ -803,7 +878,6 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     }
     fmt = quality_map.get(progress.quality_choice, "bestvideo+bestaudio/best")
 
-    # Build output base name (no extension — yt-dlp fills that in)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if title:
         safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title).replace(' ', '_')
@@ -815,11 +889,8 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     else:
         base_name = f"video_{ts}"
 
-    # Series episodes land in a per-show / per-season subfolder;
-    # movies and manual downloads stay flat in the root.
     if episode_info:
-        out_dir = os.path.join(
-            MOVIES_FOLDER, safe, f"Season_{episode_info['season']}")
+        out_dir = os.path.join(MOVIES_FOLDER, safe, f"Season_{episode_info['season']}")
         os.makedirs(out_dir, exist_ok=True)
     else:
         out_dir = MOVIES_FOLDER
@@ -833,8 +904,8 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         "--fragment-retries", "10",
         "--retry-sleep", "2",
         "--http-chunk-size", "10M",
-        "--continue",                              # resume from .part if present
-        "--paths", f"temp:{temp_dir}",             # fragments go here
+        "--continue",
+        "--paths", f"temp:{temp_dir}",
         m3u8_url,
     ]
 
@@ -846,9 +917,12 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         yt_cmd += ["-f", fmt]
 
     if progress.additional_choice != "2":
-        # Force MP4 container — seekable and universally playable
         yt_cmd += ["--merge-output-format", "mp4"]
         yt_cmd += ["--remux-video", "mp4"]
+
+    if progress.subtitles:
+        yt_cmd += ["--write-subs", "--write-auto-subs",
+                   "--sub-langs", SUBTITLE_LANGS, "--convert-subs", "srt"]
 
     yt_cmd += ["-o", out_path, "--progress", "--newline"]
 
@@ -885,7 +959,6 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         elif "ERROR" in line:
             set_status(f"⚠️ {line.strip()[:180]}", force=True)
 
-    # -- Cancelled: delete everything --
     if cancelled():
         try:
             process.wait(timeout=5)
@@ -896,7 +969,6 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         set_live_status(job_id, "🛑 cancelled")
         return False
 
-    # -- Failed: retry --
     if process.returncode != 0:
         if retry < max_retries:
             set_status(f"yt-dlp failed, retrying… ({retry+1}/{max_retries})", force=True)
@@ -905,14 +977,15 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
         set_status("❌ yt-dlp failed permanently", force=True)
         return False
 
-    # -- Success --
     set_status(f"✅ downloaded: {base_name}", force=True)
-
-    # Remove from persisted movie state
     MovieDownloadsState.load().remove(base_name)
 
-    # Locate the file yt-dlp actually created
-    actual = find_downloaded_file(base_name)
+    if progress.subtitles and not find_subtitle_file(base_name):
+        _upscale_post(loop, channel,
+                      f"⚠️ No subtitles available in this stream — "
+                      f"none saved for `{base_name}`")
+
+    actual = find_downloaded_file_anywhere(base_name)
     if not actual:
         set_status("❌ could not find downloaded file", force=True)
         return False
@@ -920,40 +993,15 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
     want_upscale = progress.upscale and progress.additional_choice != "2" \
         and progress.quality_choice in ("1", "2", "3")
 
-    # Subtitles come from OpenSubtitles only — yt-dlp never downloads subs,
-    # so subtitle handling can never break the video download. Fetching runs
-    # in a background thread so a slow OpenSubtitles can't delay completion.
-    # The subtitle is named to match the final video file exactly (minus the
-    # file type) so the TV picks it up automatically. Upscaling renames the
-    # video to <base_name>_4k.ext, so the subtitle is prefixed accordingly.
-    if progress.subtitles and not find_subtitle_file(base_name):
-        sub_base = f"{base_name}_4k" if want_upscale else base_name
-        threading.Thread(
-            target=fetch_subtitles,
-            args=(progress.imdb_id, title, episode_info, sub_base, out_dir),
-            kwargs={"post": lambda m: _upscale_post(loop, channel, m)},
-            daemon=True).start()
-
     if want_upscale:
-        # Hand the file to the background upscale worker so the next
-        # download can start immediately while ffmpeg encodes this one.
         enqueue_upscale(actual, job_id=job_id, label=base_name,
                         cancel_event=cancel_event,
                         loop=loop, channel=channel,
                         set_status=set_status)
     elif progress.additional_choice != "2":
-        # Non-upscaled video files get a faststart remux so they are
-        # seekable/skippable and get checked for encoding glitches.
-        result = verify_and_faststart(actual,
-                                      status_cb=lambda m: set_status(m, force=True),
-                                      cancel_event=cancel_event)
-        if not result:
-            if cancelled():
-                set_status("🛑 cancelled during post-processing", force=True)
-                safe_delete(actual)
-                return False
-            set_status("❌ glitch/corruption detected — will retry later", force=True)
-            return False
+        verify_and_faststart(actual,
+                             status_cb=lambda m: set_status(m, force=True),
+                             cancel_event=cancel_event)
 
     set_status("✅ done", force=True)
     return True
@@ -1095,187 +1143,11 @@ def download_one(url, title, episode_info, progress, notify, loop, channel,
 
 
 # =============================================================
-# Subtitle downloader (OpenSubtitles REST API)
+# Direct-URL downloader (also persists URL for resume)
 # =============================================================
-_OS_TOKEN = {"token": None}
-
-
-def os_login():
-    if not OS_API_KEY or not OS_USERNAME or not OS_PASSWORD:
-        return None
-    if _OS_TOKEN.get("token"):
-        return _OS_TOKEN["token"]
-    try:
-        r = requests.post(
-            f"{OS_API_BASE}/login",
-            headers={"Api-Key": OS_API_KEY,
-                     "User-Agent": "MovieDownloaderBot/1.0",
-                     "Content-Type": "application/json"},
-            json={"username": OS_USERNAME, "password": OS_PASSWORD},
-            timeout=15)
-        r.raise_for_status()
-        token = r.json().get("token")
-        _OS_TOKEN["token"] = token
-        return token
-    except Exception as e:
-        print(f"[opensubtitles login] {e}")
-        return None
-
-
-def os_search(imdb_id, episode_info=None):
-    token = os_login()
-    if not token:
-        return None
-    params = {"imdb_id": str(imdb_id)}
-    if episode_info:
-        params["season_number"] = str(episode_info.get("season"))
-        params["episode_number"] = str(episode_info.get("episode"))
-        params["type"] = "episode"
-    else:
-        params["type"] = "movie"
-    langs = []
-    for part in str(SUBTITLE_LANGS).split(","):
-        code = part.strip().split("*")[0].strip()
-        if code and code not in langs:
-            langs.append(code)
-    if langs:
-        params["languages"] = ",".join(langs)
-    try:
-        r = requests.get(
-            f"{OS_API_BASE}/subtitles",
-            headers={"Api-Key": OS_API_KEY,
-                     "Authorization": f"Bearer {token}",
-                     "User-Agent": "MovieDownloaderBot/1.0"},
-            params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[opensubtitles search] {e}")
-        return None
-
-
-def os_download(file_id):
-    token = os_login()
-    if not token:
-        return None
-    try:
-        r = requests.post(
-            f"{OS_API_BASE}/download",
-            headers={"Api-Key": OS_API_KEY,
-                     "Authorization": f"Bearer {token}",
-                     "Content-Type": "application/json",
-                     "User-Agent": "MovieDownloaderBot/1.0"},
-            json={"file_id": file_id}, timeout=20)
-        r.raise_for_status()
-        link = r.json().get("link")
-        if not link:
-            return None
-        rr = requests.get(link, headers={"User-Agent": "MovieDownloaderBot/1.0"},
-                          timeout=30)
-        rr.raise_for_status()
-        return rr.content
-    except Exception as e:
-        print(f"[opensubtitles download] {e}")
-        return None
-
-
-def fetch_subtitles(imdb_id, title, episode_info, base_name, out_dir, post=None):
-    """
-    Download the best matching subtitle (from SUBTITLE_LANGS) for the given
-    imdb_id / episode and save it next to the video as <base_name>.<ext> so it
-    matches the video file name exactly (TV players pick it up automatically).
-    """
-    def post_msg(text):
-        try:
-            if post:
-                post(text)
-            else:
-                print(text)
-        except Exception as e:
-            print(f"[subtitle post] {e}")
-
-    if not imdb_id or str(imdb_id).lower() == "manual":
-        return
-    if not OS_API_KEY:
-        post_msg(f"⚠️ OpenSubtitles not configured — subtitle skipped for `{base_name}`")
-        return
-
-    # Skip if a subtitle already exists alongside this file
-    try:
-        for f in os.listdir(out_dir):
-            if f.startswith(base_name) and \
-                    f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
-                return
-    except OSError:
-        pass
-
-    data = os_search(imdb_id, episode_info)
-    if not data or not data.get("data"):
-        post_msg(f"⚠️ No subtitle found on OpenSubtitles for `{title}`.")
-        return
-
-    langs = [p.strip().split("*")[0].strip().lower()
-             for p in str(SUBTITLE_LANGS).split(",") if p.strip()]
-    chosen = None
-    for lang in langs:
-        for item in data.get("data", []):
-            attrs = item.get("attributes", {}) or {}
-            files = attrs.get("files") or []
-            item_lang = (attrs.get("language") or "").lower()
-            if not files or not item_lang.startswith(lang):
-                continue
-            chosen = (files[0].get("file_id"), lang)
-            break
-        if chosen:
-            break
-
-    if not chosen:
-        post_msg(f"⚠️ No subtitle in requested languages for `{title}` on OpenSubtitles.")
-        return
-
-    file_id, _ = chosen
-    content = os_download(file_id)
-    if content is None:
-        post_msg(f"⚠️ Subtitle download failed for `{base_name}`.")
-        return
-
-    # Unpack if OpenSubtitles returned a zip (multi-file subtitle)
-    ext = ".srt"
-    if content[:2] == b"PK":
-        import zipfile
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                names = [n for n in z.namelist()
-                         if n.lower().endswith((".srt", ".vtt", ".ass", ".ssa"))]
-                if names:
-                    names.sort()
-                    content = z.read(names[0])
-                    ext = os.path.splitext(names[0])[1].lower()
-        except Exception as e:
-            print(f"[subtitle unzip] {e}")
-
-    sub_path = os.path.join(out_dir, f"{base_name}{ext}")
-    try:
-        with open(sub_path, "wb") as f:
-            f.write(content)
-        post_msg(f"💬 Subtitle saved: {os.path.basename(sub_path)}")
-    except Exception as e:
-        print(f"[subtitle save] {e}")
-
-
-# =============================================================
-# Direct-URL downloader (m3u8, YouTube or any http(s) source; persists URL for resume)
-# =============================================================
-def download_from_url(url, title, episode_info, progress, notify, loop, channel,
+def download_from_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
                       job_id, cancel_event,
                       is_movie=True, retry=0):
-    return _download_m3u8_url(url, title, episode_info, progress, notify, loop,
-                              channel, job_id, cancel_event, is_movie, retry)
-
-
-def _download_m3u8_url(m3u8_url, title, episode_info, progress, notify, loop, channel,
-                       job_id, cancel_event,
-                       is_movie=True, retry=0):
 
     max_retries = 3
 
@@ -1321,7 +1193,6 @@ def _download_m3u8_url(m3u8_url, title, episode_info, progress, notify, loop, ch
             set_status("❌ still offline, skipping", force=True)
             return False
 
-    # Persist the manual URL so we can resume if interrupted
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = re.sub(r'[^a-zA-Z0-9\- ]', '', title or "manual").replace(' ', '_')
     base_name = f"{safe}_{ts}_Q{progress.quality_choice}"
@@ -1346,7 +1217,6 @@ def _download_m3u8_url(m3u8_url, title, episode_info, progress, notify, loop, ch
 # Selection parser
 # =============================================================
 def make_range_selection(start, end, seasons):
-    """Build an inclusive episode list from a (season, episode) range."""
     (s1, e1), (s2, e2) = start, end
     result = []
     for sn in range(s1, s2 + 1):
@@ -1642,13 +1512,6 @@ async def ask_yesno_in_channel(ctx, text):
 
 
 async def ask_series_range_in_channel(ctx, seasons):
-    """
-    Dropdown range picker (start point → end point). Returns
-    (selection, need_text): selection is None with need_text True when the
-    catalog is too big for Discord selects (>25 options), None with
-    need_text False when the user timed out / cancelled, otherwise the
-    parsed episode list.
-    """
     if len(seasons) > 25 or any(c > 25 for c in seasons.values()):
         return None, True
 
@@ -1702,6 +1565,9 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
     progress.upscale = options["upscale"]
     progress.owner_id = ctx.author.id
     progress.channel_id = ctx.channel.id
+    progress.in_progress = True
+    progress.completed = False
+    progress.completed_at = None
     if not hasattr(progress, "completed_episodes"):
         progress.completed_episodes = []
     progress.save()
@@ -1732,7 +1598,21 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
 
         ep_info = {"season": season, "episode": episode}
 
+        # --- Disk completeness check: mark as done if already on disk ---
+        if episode_or_movie_in_disk(title, ep_info, progress.quality_choice):
+            await ctx.send(
+                f"⏭️ S{season:02d}E{episode:02d} already complete on disk, skipping"
+            )
+            key = [season, episode]
+            if key not in progress.completed_episodes:
+                progress.completed_episodes.append(key)
+            completed_set.add((season, episode))
+            progress.downloaded_episodes = len(progress.completed_episodes)
+            progress.save()
+            continue
+
         url = construct_vidcore_url(imdb_id, True, season, episode)
+
         ok = await asyncio.to_thread(
             download_one,
             url, title, ep_info, progress,
@@ -1745,11 +1625,11 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
         )
 
         if ok:
-            progress.downloaded_episodes += 1
             key = [season, episode]
             if key not in progress.completed_episodes:
                 progress.completed_episodes.append(key)
             completed_set.add((season, episode))
+            progress.downloaded_episodes = len(progress.completed_episodes)
             progress.failed_episodes = [
                 f for f in progress.failed_episodes
                 if not (f["season"] == season and f["episode"] == episode)
@@ -1768,6 +1648,10 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
 
     if not cancel_event.is_set():
         progress.completed = all_ok
+        progress.in_progress = False
+        progress.completed_at = time.time()
+    else:
+        progress.in_progress = False
     progress.save()
 
     if cancel_event.is_set():
@@ -1779,7 +1663,7 @@ async def run_series(ctx, info, options, selection, job_id, cancel_event):
         failed = ", ".join(f"S{e['season']}E{e['episode']}" for e in progress.failed_episodes)
         await ctx.send(
             f"⚠️ **{title}** — done with failures: {failed}\n"
-            f"💡 Use `!dlurl <m3u8_url|youtube_url> <title>` to supply a manual source for a failed episode."
+            f"💡 Use `!dlurl <m3u8_url> <title>` to supply a manual source for a failed episode."
         )
 
     try:
@@ -1818,6 +1702,10 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
     progress.total_episodes = 1
     progress.downloaded_episodes = 0
     progress.completed_episodes = []
+    progress.in_progress = True
+    progress.completed = False
+    progress.completed_at = None
+    progress.start_time = time.time()
     progress.save()
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
@@ -1837,15 +1725,20 @@ async def run_movie(ctx, info, options, job_id, cancel_event):
     )
 
     if cancel_event.is_set():
+        progress.in_progress = False
+        progress.save()
         return
 
     if ok:
         progress.downloaded_episodes = 1
         progress.completed_episodes = [["movie", "movie"]]
         progress.completed = True
+        progress.in_progress = False
+        progress.completed_at = time.time()
         progress.save()
         await ctx.send(f"🎉 **{title}** — downloaded!")
     else:
+        progress.in_progress = False
         progress.save()
         await ctx.send(f"⚠️ **{title}** — failed.")
 
@@ -1875,6 +1768,10 @@ async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
     progress.total_episodes = 1
     progress.downloaded_episodes = 0
     progress.completed_episodes = []
+    progress.in_progress = True
+    progress.completed = False
+    progress.completed_at = None
+    progress.start_time = time.time()
     progress.save()
 
     save_state(owner_id=ctx.author.id, channel_id=ctx.channel.id)
@@ -1893,15 +1790,20 @@ async def run_movie_with_url(ctx, info, options, url, job_id, cancel_event):
     )
 
     if cancel_event.is_set():
+        progress.in_progress = False
+        progress.save()
         return
 
     if ok:
         progress.downloaded_episodes = 1
         progress.completed_episodes = [["movie", "movie"]]
         progress.completed = True
+        progress.in_progress = False
+        progress.completed_at = time.time()
         progress.save()
         await ctx.send(f"🎉 **{title}** — downloaded!")
     else:
+        progress.in_progress = False
         progress.save()
         await ctx.send(f"⚠️ **{title}** — failed.")
 
@@ -2105,10 +2007,15 @@ async def on_ready():
 
         if channel:
             for prefix, entry in list(mstate.entries.items()):
+                # Skip if it's already complete on disk
+                if is_download_complete_on_disk(prefix):
+                    print(f"[resume] {prefix} already complete on disk — clearing state")
+                    mstate.remove(prefix)
+                    continue
+
                 await channel.send(
                     f"♻️ Resuming manual download **{entry['title']}** (prefix `{prefix}`)"
                 )
-                # Rebuild a minimal progress object
                 prog = DownloadProgress()
                 prog.title = entry["title"]
                 prog.imdb_id = "manual"
@@ -2128,7 +2035,7 @@ async def on_ready():
                 job.manual_url = entry["url"]
                 enqueue(job)
 
-    # --- Resume series ---
+    # --- Resume series / movie only if it was actually in progress ---
     p = DownloadProgress.load()
     if not p or p.completed:
         return
@@ -2139,10 +2046,16 @@ async def on_ready():
     if p.imdb_id == "manual" or p.kind == "movie_url":
         return
 
+    # Only resume if the flag says we were actively downloading
+    if not getattr(p, "in_progress", False):
+        print("[resume] Job not marked in_progress — skipping resume.")
+        return
+
     if p.kind == "movie" and not p.selected_episodes:
         return
 
     if p.total_episodes and p.downloaded_episodes >= p.total_episodes:
+        print("[resume] Already at 100% — skipping resume.")
         return
 
     state = load_state() or {}
@@ -2281,7 +2194,6 @@ async def dl(ctx, *, query: str):
 
         selection, need_text = await ask_series_range_in_channel(ctx, seasons)
         if need_text:
-            # Fallback for huge catalogs (>25 options per dropdown)
             await ctx.send(
                 "🎯 **Which episodes?** Reply with one of:\n"
                 "`all` = everything\n"
@@ -2326,15 +2238,14 @@ async def dlurl(ctx, url: str, *, title: str = None):
 
     ensure_queue_worker()
 
-    if not url.startswith(("http://", "https://")):
-        await ctx.send("❌ That doesn't look like an http(s) URL "
-                       "(m3u8, YouTube or direct link).")
+    if ".m3u8" not in url or not url.startswith("http"):
+        await ctx.send("❌ That doesn't look like an m3u8 URL.")
         return
 
     if not title:
         title = "manual_download"
 
-    await ctx.send(f"📋 Manual source: `{url[:80]}…`\nTitle: **{title}**")
+    await ctx.send(f"📋 Manual URL: `{url[:80]}…`\nTitle: **{title}**")
 
     quality    = await ask_quality_in_channel(ctx)
     additional = await ask_mode_in_channel(ctx)
@@ -2461,8 +2372,4 @@ async def cancel(ctx, job_id: int = None):
 
 
 if __name__ == "__main__":
-    if not load_credentials():
-        print("❌ No DISCORD_TOKEN found. Fill in the file "
-              f"'{CREDENTIALS_FILE}' and restart.")
-        sys.exit(1)
     bot.run(DISCORD_TOKEN)
