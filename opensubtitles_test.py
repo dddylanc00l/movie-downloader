@@ -10,7 +10,9 @@ Examples:
 
 import argparse
 import os
+import re
 import sys
+from urllib.parse import urlparse
 
 try:
     import requests
@@ -55,7 +57,9 @@ def main():
     parser.add_argument("--season", type=int, help="TV season number")
     parser.add_argument("--episode", type=int, help="TV episode number")
     parser.add_argument("--download", choices=("en", "nl"),
-                        help="Also request a temporary download link for this language")
+                        help="Download the highest-ranked subtitle for this language")
+    parser.add_argument("--output-dir", default=SCRIPT_DIR,
+                        help="Directory to save a downloaded subtitle (default: script directory)")
     args = parser.parse_args()
 
     api_key = load_api_key()
@@ -134,7 +138,21 @@ def main():
             if not link:
                 print("ERROR: OpenSubtitles returned no download link.")
                 return 1
-            print("OK: temporary subtitle download link was issued.")
+            print("Temporary subtitle download link was issued; downloading file...")
+            file_response = requests.get(link, timeout=60)
+            print(f"File download response: HTTP {file_response.status_code}")
+            if not file_response.ok:
+                print(file_response.text[:500])
+                return 1
+
+            output_dir = os.path.abspath(args.output_dir)
+            os.makedirs(output_dir, exist_ok=True)
+            release = re.sub(r'[<>:"/\\|?*]+', "_", match["release"]).strip(". ")
+            filename = f"{release or 'subtitle'}.{args.download}.srt"
+            output_path = os.path.join(output_dir, filename)
+            with open(output_path, "wb") as subtitle_file:
+                subtitle_file.write(file_response.content)
+            print(f"OK: saved subtitle to {output_path}")
         except requests.RequestException as error:
             print(f"ERROR: could not request subtitle download link: {error}")
             return 1
