@@ -90,6 +90,9 @@ STATUS_EDIT_INTERVAL = 8.0
 SUBTITLE_LANGS = "en.*,nl.*"
 OPENSUBS_API_URL = "https://api.opensubtitles.com/api/v1"
 OPENSUBS_LANGUAGES = ("en", "nl")
+# Many TVs only detect a sidecar subtitle whose filename exactly matches the
+# video.  This selects which downloaded language becomes `Movie.srt`.
+PRIMARY_SUBTITLE_LANGUAGE = "nl"
 
 if not DISCORD_TOKEN:
     print("❌ DISCORD_TOKEN is empty. Check credentials.txt.")
@@ -207,6 +210,35 @@ def find_subtitle_file(base_name):
             if f.startswith(base_name) and \
                     f.lower().endswith((".srt", ".vtt", ".ass", ".ssa")):
                 return os.path.join(root, f)
+    return None
+
+
+def make_tv_compatible_subtitle(video_file):
+    """Create `Movie.srt` from a language-labelled sidecar such as `Movie.nl.srt`.
+
+    Language-labelled files are kept for players that support selecting tracks.
+    A single exact-name copy is provided for TVs that only recognize `Movie.srt`.
+    """
+    subtitle_base = os.path.splitext(video_file)[0]
+    exact_name = subtitle_base + ".srt"
+    if os.path.isfile(exact_name):
+        return exact_name
+
+    preferred = (PRIMARY_SUBTITLE_LANGUAGE, "nl", "en")
+    tried = set()
+    for language in preferred:
+        if language in tried:
+            continue
+        tried.add(language)
+        candidate = f"{subtitle_base}.{language}.srt"
+        if os.path.isfile(candidate):
+            try:
+                shutil.copyfile(candidate, exact_name)
+                print(f"[subtitles] TV-compatible subtitle: {exact_name}")
+                return exact_name
+            except OSError as error:
+                print(f"[subtitles] could not create {exact_name}: {error}")
+                return None
     return None
 
 
@@ -999,6 +1031,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
                 status_cb=lambda m: set_status(m, force=True),
                 report_cb=lambda m: _upscale_post(loop, channel, m),
             )
+            make_tv_compatible_subtitle(actual)
         if actual and progress.additional_choice != "2":
             # A prior run may have exited after yt-dlp finished but before
             # faststart replaced the file.  Re-run the stream-copy pass on
@@ -1152,6 +1185,7 @@ def _ytdlp_run(m3u8_url, title, episode_info, progress,
             status_cb=lambda m: set_status(m, force=True),
             report_cb=lambda m: _upscale_post(loop, channel, m),
         )
+        make_tv_compatible_subtitle(actual)
 
     want_upscale = progress.upscale and progress.additional_choice != "2" \
         and progress.quality_choice in ("1", "2", "3")
