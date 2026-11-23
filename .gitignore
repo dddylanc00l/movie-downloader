@@ -1,6 +1,8 @@
 chrome_profile/
 movies/
+__pycache__/
 *.mp4
 *.pkl
 *.part
 *.ytdl
+credentials.txt
